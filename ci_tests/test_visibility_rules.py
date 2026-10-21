@@ -4,7 +4,6 @@
 после чего проверяются чистые функции скоупов:
 
   * _get_subordinates — рекурсия по reports_to;
-  * _metrics_allowed_depts/_strip_metrics — «ЦКП всем, метрики по праву»;
   * константы ролей полного доступа.
 
 Полные интеграционные тесты скоупов (emp/dir/hr на живом сайте) —
@@ -60,6 +59,15 @@ class TestVisibilityRules(unittest.TestCase):
         """Рядовой сотрудник — без подчинённых."""
         self.assertEqual(self.page._get_subordinates("KAM"), set())
 
+    def test_dept_goals_fetch_isolated(self):
+        """Цели отделов читаются из Goal.custom_department (без JSON-поля метрик).
+
+        Функция больше не обращается к Department.custom_metrics —
+        источник целей отдела — только Goal из hrms.
+        """
+        # пустой список отделов -> пустой словарь, без обращений к БД
+        self.assertEqual(self.page._get_dept_goals([]), {})
+
     def _perms(self, is_hr=False, is_manager=False, ids=None):
         return {
             "is_hr": is_hr,
@@ -69,48 +77,34 @@ class TestVisibilityRules(unittest.TestCase):
             "visible_employee_ids": ids or [],
         }
 
-    def _depts(self):
-        return [
-            {"name": "Sales", "custom_metrics": '[{"name":"rev"}]'},
-            {"name": "Support", "custom_metrics": '[{"name":"csat"}]'},
-        ]
 
-    def test_metrics_hr_sees_all(self):
-        """HR: метрики всех отделов остаются в ответе."""
-        allowed = self.page._metrics_allowed_depts(
-            self._perms(is_hr=True), self._depts(), ["Sales", "Support"]
-        )
-        self.assertEqual(allowed, {"Sales", "Support"})
+def _read(path):
+    with open(path, encoding="utf-8") as f:
+        return f.read()
 
-    def test_metrics_manager_sees_branch_only(self):
-        """Руководитель: метрики только отделов своей ветки."""
-        allowed = self.page._metrics_allowed_depts(
-            self._perms(is_manager=True, ids=["CEO", "HS"]), self._depts(), ["Sales"]
-        )
-        self.assertEqual(allowed, {"Sales"})
 
-    def test_metrics_employee_sees_none(self):
-        """Рядовой: метрик нет вовсе (ЦКП при этом ему доступен)."""
-        allowed = self.page._metrics_allowed_depts(
-            self._perms(is_hr=False, is_manager=False), self._depts(), []
-        )
-        self.assertEqual(allowed, set())
+class TestMetricsFieldRemoved(unittest.TestCase):
+    """v0.3: JSON-поле метрик удалено — метрики отдела = Goal.custom_department."""
 
-    def test_strip_metrics_employee(self):
-        """Вырезание: у сотрудника метрики удаляются из ответа сервера."""
-        depts = self._depts()
-        self.page._strip_metrics(depts, set())
-        self.assertNotIn("custom_metrics", depts[0])
-        self.assertNotIn("custom_metrics", depts[1])
-        # остальные поля не трогаем
-        self.assertEqual(depts[0]["name"], "Sales")
+    ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "org_chart_mtp"))
 
-    def test_strip_metrics_keeps_allowed(self):
-        """Вырезание: разрешённые отделы метрики сохраняют."""
-        depts = self._depts()
-        self.page._strip_metrics(depts, {"Sales"})
-        self.assertEqual(depts[0]["custom_metrics"], '[{"name":"rev"}]')
-        self.assertNotIn("custom_metrics", depts[1])
+    def test_page_has_no_metrics_json(self):
+        """Бэкенд страницы не упоминает custom_metrics."""
+        src = _read(os.path.join(self.ROOT, "org_chart", "page", "org_chart_mtp", "org_chart_mtp.py"))
+        self.assertNotIn("custom_metrics", src)
+
+    def test_events_has_no_metrics_validator(self):
+        """Хук валидации JSON-метрик удалён."""
+        src = _read(os.path.join(self.ROOT, "api", "events.py"))
+        self.assertNotIn("validate_department", src)
+        hooks_src = _read(os.path.join(self.ROOT, "hooks.py"))
+        self.assertNotIn("validate_department", hooks_src)
+
+    def test_patch_registered(self):
+        """Патч v0.3 зарегистрирован в patches.txt."""
+        src = _read(os.path.join(self.ROOT, "patches.txt"))
+        self.assertIn("org_chart_mtp.patches.v0_3_remove_metrics", src)
+        self.assertTrue(os.path.exists(os.path.join(self.ROOT, "patches", "v0_3_remove_metrics.py")))
 
 
 if __name__ == "__main__":

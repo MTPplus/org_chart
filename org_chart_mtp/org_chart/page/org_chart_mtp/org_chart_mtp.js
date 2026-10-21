@@ -10,16 +10,22 @@
 //    - Зум к курсору (колесо мыши + кнопки), панорамирование
 //    - Pointer events: мышь + тач/планшет единообразно;
 //      зажатие ЛКМ на плитке = пан, короткий клик = открыть плитку
+//      (захват указателя — только после порога движения, иначе click
+//      по плитке ретаргетится на обёртку и не сработает)
 //    - Поиск по отделам/сотрудникам с автоскроллом и подсветкой узла
-//    - Экспорт PNG и PDF всего оргчарта
+//    - Экспорт всего оргчарта: PNG / JPG (масштаб, качество)
+//      и векторный PDF с выделяемым текстом (рендер на сервере)
+//      с откатом на растровый PDF, если сервер не может
 //    - Плитка отдела: ЦКП (по умолчанию) или Функции — переключается
 //      в шапке и в Org Chart Settings; выбор запоминается
 //    - Боковая панель: Функции (по умолчанию) или ЦКП — переключается
 //    - Цвет плитки — из Department.custom_color (hex), иначе нейтральный
-//    - Клик по отделу → панель (Папка / Wiki / Цели и метрики)
+//    - Клик по отделу → панель (Папка / Wiki / Цели)
+//      Цели отдела — обычные Goal из hrms, закреплённые полем
+//      «Отдел» (Goal.custom_department); каждая цель — ссылка на документ
 //    - Клик по сотруднику → панель сотрудника
 //    - Сворачивание/разворачивание подотделов
-//    - Права: HR/руководитель видят цели и метрики, рядовой — только свои
+//    - Права: HR/руководитель видят цели, рядовой — только свои
 //    - i18n: строки обёрнуты в __() — переводятся через стандартные
 //      CSV-файлы переводов Frappe при необходимости
 // =====================================================================
@@ -61,6 +67,7 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
         lastPanEnd: 0,        // timestamp: гард «клик сразу после пана»
         searchTerm: '',
         hasCentered: false,
+        exportSize: null,    // кэш размеров контейнера экспорта (для диалога)
     };
 
     // === HTML-каркас + CSS ===
@@ -140,12 +147,21 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
             .org-file-meta { font-size: 10px; color: #9ca3af; }
             .org-wiki-link { display: block; padding: 12px; border: 1px solid #bfdbfe; background: #eff6ff; border-radius: 6px; text-decoration: none; }
             .org-wiki-link:hover { border-color: #60a5fa; }
-            .org-goal-item { padding: 8px; border: 1px solid #e5e7eb; border-radius: 6px; background: #f9fafb; margin-bottom: 8px; }
-            .org-goal-text { font-size: 12px; color: #111827; margin-bottom: 4px; }
+            .org-goal-item { display: block; padding: 8px; border: 1px solid #e5e7eb; border-radius: 6px; background: #f9fafb; margin-bottom: 8px; text-decoration: none; color: inherit; transition: border-color 0.15s, background 0.15s; }
+            .org-goal-item:hover { border-color: #93c5fd; background: white; }
+            .org-goal-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 6px; }
+            .org-goal-top svg { width: 12px; height: 12px; color: #9ca3af; flex-shrink: 0; margin-top: 2px; }
+            .org-goal-text { font-size: 12px; color: #111827; margin-bottom: 4px; font-weight: 500; }
+            .org-goal-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+            .org-goal-status { display: inline-block; padding: 1px 6px; border-radius: 999px; font-size: 9px; font-weight: 600; white-space: nowrap; }
+            .org-goal-status.st-pending { background: #f3f4f6; color: #6b7280; }
+            .org-goal-status.st-inprogress { background: #dbeafe; color: #1d4ed8; }
+            .org-goal-status.st-completed { background: #dcfce7; color: #15803d; }
+            .org-goal-status.st-archived { background: #f9fafb; color: #9ca3af; }
+            .org-goal-status.st-closed { background: #ede9fe; color: #6d28d9; }
+            .org-goal-owner { display: inline-flex; align-items: center; gap: 3px; font-size: 10px; color: #6b7280; }
+            .org-goal-owner svg { width: 11px; height: 11px; flex-shrink: 0; }
             .org-goal-due { font-size: 10px; color: #6b7280; }
-            .org-metric-item { padding: 8px; border: 1px solid #e5e7eb; border-radius: 6px; margin-bottom: 8px; }
-            .org-metric-name { font-size: 12px; font-weight: 500; color: #111827; }
-            .org-metric-value { font-size: 10px; color: #6b7280; }
             .org-progress-bar { height: 6px; background: #e5e7eb; border-radius: 3px; overflow: hidden; margin-top: 4px; }
             .org-progress-fill { height: 100%; background: #22c55e; border-radius: 3px; transition: width 0.3s; }
             .org-restricted { padding: 32px 16px; text-align: center; color: #9ca3af; font-size: 12px; }
@@ -172,7 +188,8 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
             .org-search-item .subtitle { font-size: 10px; color: #9ca3af; max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
             .org-search-empty { padding: 12px; font-size: 12px; color: #9ca3af; text-align: center; }
             .org-export-controls { display: flex; align-items: center; gap: 4px; border: 1px solid #e5e7eb; border-radius: 6px; background: white; }
-            .org-export-controls button { padding: 6px 10px; border: none; background: none; cursor: pointer; color: #4b5563; font-size: 11px; font-weight: 600; }
+            .org-export-controls button { display: inline-flex; align-items: center; gap: 5px; padding: 6px 10px; border: none; background: none; cursor: pointer; color: #4b5563; font-size: 11px; font-weight: 600; }
+            .org-export-controls button svg { width: 12px; height: 12px; }
             .org-export-controls button:hover { background: #f3f4f6; color: #111827; }
             .org-export-controls button:disabled { opacity: 0.5; cursor: wait; }
             .org-node, .org-emp-chip, .org-collapse-btn { -webkit-tap-highlight-color: transparent; }
@@ -203,8 +220,10 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
                         <button class="org-switch-btn" data-panel-mode="Функции">${__('Функции')}</button>
                     </div>
                     <div class="org-export-controls">
-                        <button id="export-png" title="${__('Скачать PNG')}">PNG</button>
-                        <button id="export-pdf" title="${__('Скачать PDF')}">PDF</button>
+                        <button id="export-btn" title="${__('Экспорт оргчарта: PNG / JPG (с выбором разрешения) или векторный PDF (текст выделяется)')}">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                            ${__('Экспорт')}
+                        </button>
                     </div>
                     <div class="org-zoom-controls">
                         <button id="zoom-out" title="${__('Уменьшить')}">−</button>
@@ -228,7 +247,6 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
         folder: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>',
         book: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>',
         target: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg>',
-        trend: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></svg>',
         user: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>',
         close: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>',
         file: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>',
@@ -476,6 +494,7 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
     }
 
     function renderTree() {
+        state.exportSize = null; // дерево изменилось — сброс кэша размеров экспорта
         if (!state.data || state.data.departments.length === 0) {
             $('#org-canvas').html('<div style="text-align:center;padding:40px;color:#9ca3af;">' + __('Нет данных. Создайте Department в ERPNext.') + '</div>');
             return;
@@ -540,12 +559,8 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
         var ckp = node.kra_title || '';
         var ckpDesc = node.kra_description || '';
         var wikiUrl = node.custom_wiki_url || ('/app/Department/' + encodeURIComponent(node.name));
-        // Метрики отделов видят: HR или руководитель (есть подчинённые)
-        var canViewMetrics = (state.permissions && state.permissions.is_hr) || (state.permissions && state.permissions.is_manager);
-        var metrics = [];
-        if (canViewMetrics && node.custom_metrics) {
-            try { metrics = JSON.parse(node.custom_metrics); } catch (e) { /* битый JSON — игнорируем */ }
-        }
+        // Цели отдела видят: HR или руководитель (есть подчинённые)
+        var canViewGoals = (state.permissions && state.permissions.is_hr) || (state.permissions && state.permissions.is_manager);
 
         var html = '';
         // Шапка
@@ -586,8 +601,8 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
         html += '<div class="org-panel-tabs">';
         html += '<button class="org-tab ' + (state.activeTab === 'folder' ? 'active' : '') + '" data-tab="folder">' + ICONS.folder + __('Папка') + '</button>';
         html += '<button class="org-tab ' + (state.activeTab === 'wiki' ? 'active' : '') + '" data-tab="wiki">' + ICONS.book + 'Wiki</button>';
-        if (canViewMetrics) {
-            html += '<button class="org-tab ' + (state.activeTab === 'goals' ? 'active' : '') + '" data-tab="goals">' + ICONS.target + __('Цели и метрики') + '</button>';
+        if (canViewGoals) {
+            html += '<button class="org-tab ' + (state.activeTab === 'goals' ? 'active' : '') + '" data-tab="goals">' + ICONS.target + __('Цели') + '</button>';
         }
         html += '</div>';
 
@@ -598,7 +613,7 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
         } else if (state.activeTab === 'wiki') {
             html += renderWikiTab(wikiUrl);
         } else if (state.activeTab === 'goals') {
-            html += renderGoalsMetricsTab(node, metrics);
+            html += renderGoalsTab(node);
         }
         html += '</div>';
 
@@ -644,17 +659,32 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
     }
 
     // === Общий рендер списка целей (отдел + сотрудник) ===
-    function renderGoalItems(goals) {
+    // Каждая цель — обычный Goal из hrms; карточка цели — ссылка
+    // на документ Goal (открывается в новой вкладке).
+    var GOAL_STATUS_META = {
+        'Pending':     { label: __('Ожидает'),   cls: 'st-pending' },
+        'In Progress': { label: __('В работе'),  cls: 'st-inprogress' },
+        'Completed':   { label: __('Завершена'), cls: 'st-completed' },
+        'Archived':    { label: __('В архиве'),  cls: 'st-archived' },
+        'Closed':      { label: __('Закрыта'),   cls: 'st-closed' }
+    };
+
+    function renderGoalItems(goals, showOwner) {
         var html = '';
         goals.forEach(function (g) {
-            html += '<div class="org-goal-item">';
-            html += '<div class="org-goal-text">' + escapeHtml(g.goal_name) + '</div>';
-            if (g.end_date) html += '<div class="org-goal-due">' + ICONS.calendar + ' ' + __('Срок') + ': ' + escapeHtml(g.end_date) + '</div>';
+            var st = GOAL_STATUS_META[g.status] || null;
+            html += '<a class="org-goal-item" href="/app/goal/' + encodeURIComponent(g.name) + '" target="_blank" title="' + __('Открыть Goal в HRMS') + '">';
+            html += '<div class="org-goal-top"><div class="org-goal-text">' + escapeHtml(g.goal_name) + '</div>' + ICONS.link + '</div>';
+            html += '<div class="org-goal-meta">';
+            if (st) html += '<span class="org-goal-status ' + st.cls + '">' + st.label + '</span>';
+            if (showOwner && g.employee_name) html += '<span class="org-goal-owner">' + ICONS.user + escapeHtml(g.employee_name) + '</span>';
+            if (g.end_date) html += '<span class="org-goal-due">' + ICONS.calendar + ' ' + __('до') + ' ' + escapeHtml(g.end_date) + '</span>';
+            html += '</div>';
             if (g.progress !== undefined && g.progress !== null && g.progress !== '') {
                 html += '<div class="org-progress-bar" style="margin-top:6px;"><div class="org-progress-fill" style="width:' + g.progress + '%;"></div></div>';
                 html += '<div style="font-size:10px;color:#6b7280;margin-top:2px;">' + __('Прогресс') + ': ' + g.progress + '%</div>';
             }
-            html += '</div>';
+            html += '</a>';
         });
         return html;
     }
@@ -691,33 +721,23 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
             ICONS.link + '</div></a>';
     }
 
-    function renderGoalsMetricsTab(node, metrics) {
-        var canViewMetrics = (state.permissions && state.permissions.is_hr) || (state.permissions && state.permissions.is_manager);
-        if (!canViewMetrics) {
-            return '<div class="org-restricted">' + ICONS.target + '<p style="margin-top:8px;">' + __('Нет прав для просмотра целей и метрик') + '</p></div>';
+    function renderGoalsTab(node) {
+        var canViewGoals = (state.permissions && state.permissions.is_hr) || (state.permissions && state.permissions.is_manager);
+        if (!canViewGoals) {
+            return '<div class="org-restricted">' + ICONS.target + '<p style="margin-top:8px;">' + __('Нет прав для просмотра целей') + '</p></div>';
         }
 
+        // Цели отдела — обычные Goal из hrms, закреплённые полем
+        // Goal.custom_department (= «Отдел» на форме Goal)
         var deptGoals = (state.data.dept_goals && state.data.dept_goals[node.name]) || [];
         var html = '';
 
         html += '<div class="org-section-title">' + ICONS.target + '<span>' + __('Цели отдела') + ' (' + deptGoals.length + ')</span></div>';
         if (deptGoals.length === 0) {
-            html += '<p style="font-size:11px;color:#9ca3af;font-style:italic;margin-bottom:16px;">' + __('Целей нет. Создайте Goal с полем «Отдел»') + ' = ' + escapeHtml(node.name) + '</p>';
+            html += '<p style="font-size:11px;color:#9ca3af;font-style:italic;margin-bottom:16px;">' +
+                __('Целей нет. Создайте Goal в HRMS и закрепите её за отделом полем «Отдел»') + '</p>';
         } else {
-            html += renderGoalItems(deptGoals);
-        }
-
-        if (metrics && metrics.length > 0) {
-            html += '<div class="org-section-title" style="margin-top:16px;">' + ICONS.trend + '<span>' + __('Метрики') + ' (' + metrics.length + ')</span></div>';
-            metrics.forEach(function (m) {
-                html += '<div class="org-metric-item">';
-                html += '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px;">';
-                html += '<span class="org-metric-name">' + escapeHtml(m.name || '') + '</span>';
-                html += '<span class="org-metric-value">' + escapeHtml(m.current || '') + ' / ' + escapeHtml(m.target || '') + ' ' + escapeHtml(m.unit || '') + '</span>';
-                html += '</div>';
-                html += '<div class="org-progress-bar"><div class="org-progress-fill" style="width:' + (m.progress || 0) + '%;"></div></div>';
-                html += '</div>';
-            });
+            html += renderGoalItems(deptGoals, true);
         }
         return html;
     }
@@ -779,7 +799,7 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
                 html += '<div class="org-restricted"><p>' + __('Целей нет') + '</p></div>';
             } else {
                 html += '<div class="org-section-title">' + ICONS.target + '<span>' + __('Цели') + ' (' + goals.length + ')</span></div>';
-                html += renderGoalItems(goals);
+                html += renderGoalItems(goals, false);
             }
         }
         html += '</div>';
@@ -849,6 +869,14 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
     // Зажатие в ЛЮБОМ месте канваса (включая плитку) = пан;
     // короткий клик без движения = действие (открыть плитку/чип/кнопку).
     // Боковая панель не участвует в пане.
+    //
+    // Захват указателя (setPointerCapture) — ТОЛЬКО при начале пана.
+    // Если захватить сразу на pointerdown, браузер ретаргетит все
+    // последующие события указателя И совместимые mouse-события
+    // (mousedown/mouseup/click) на обёртку — клик по плитке умирает
+    // (баг из issue-отчёта юзера: «клик по пластинке перестал работать»).
+    // При захвате с началом пана чистый клик идёт нативно на плитку,
+    // а click сразу после пана всё равно гасится порогом + гардом lastPanEnd.
     canvasWrapper.addEventListener('pointerdown', function (e) {
         if (e.target.closest('#org-side-panel')) return;
         if (e.pointerType === 'mouse' && e.button !== 0) return;
@@ -856,14 +884,21 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
         state.panMoved = false;
         state.activePointerId = e.pointerId;
         state.panStart = { x: e.clientX, y: e.clientY, tx: state.tx, ty: state.ty };
-        try { canvasWrapper.setPointerCapture(e.pointerId); } catch (err) { /* старые браузеры */ }
+        // ВАЖНО: здесь НЕ вызываем setPointerCapture (см. комментарий выше)
     });
     canvasWrapper.addEventListener('pointermove', function (e) {
         if (!state.isPointerDown || e.pointerId !== state.activePointerId) return;
         var dx = e.clientX - state.panStart.x;
         var dy = e.clientY - state.panStart.y;
         if (!state.panMoved && Math.sqrt(dx * dx + dy * dy) < PAN_THRESHOLD) return;
-        state.panMoved = true;
+        if (!state.panMoved) {
+            // Жест стал паном — теперь захватываем указатель, чтобы
+            // события продолжали приходить даже за пределами обёртки.
+            // С этого момента совместимый click (если будет) уйдёт
+            // на обёртку — что и требуется (клик после пана не открывает плитку).
+            state.panMoved = true;
+            try { canvasWrapper.setPointerCapture(e.pointerId); } catch (err) { /* старые браузеры */ }
+        }
         state.isPanning = true;
         canvasWrapper.classList.add('panning');
         state.tx = state.panStart.tx + dx;
@@ -1037,9 +1072,15 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
         }
     }
 
-    // === Экспорт: PNG и PDF ===
-    // Рендер полного дерева (без зума/пана) в изолированный контейнер,
-    // сериализация в SVG foreignObject → canvas → PNG / PDF.
+    // === Экспорт: PNG / JPG / векторный PDF ===
+    // Растровые (PNG/JPG): рендер полного дерева (без зума/пана) в
+    // изолированный контейнер → SVG foreignObject → canvas → blob
+    // (масштаб и качество — из диалога экспорта).
+    // PDF — векторный с выделяемым текстом: тот же контейнер сериализуется
+    // и отправляется на сервер (headless-Chromium → wkhtmltopdf);
+    // при недоступности серверных движков — откат на растровый PDF.
+    var EXPORT_PDF_METHOD = 'org_chart_mtp.api.export.export_chart_pdf';
+
     function buildExportContainer() {
         var source = document.getElementById('org-canvas');
         var holder = document.createElement('div');
@@ -1063,7 +1104,46 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
         return holder;
     }
 
-    function renderExportCanvas(cb) {
+    // Размеры контейнера экспорта (для подписей разрешения в диалоге).
+    // Кэшируется в state.exportSize и сбрасывается в renderTree().
+    function getExportDimensions() {
+        if (state.exportSize) return state.exportSize;
+        var holder = null;
+        try {
+            holder = buildExportContainer();
+            state.exportSize = {
+                w: Math.ceil(holder.scrollWidth) || 1200,
+                h: Math.ceil(holder.scrollHeight) || 800
+            };
+        } catch (e) {
+            state.exportSize = { w: 1200, h: 800 };
+        } finally {
+            if (holder && holder.parentNode) holder.parentNode.removeChild(holder);
+        }
+        return state.exportSize;
+    }
+
+    // HTML-строка контейнера экспорта для серверного векторного PDF.
+    function buildExportHTML() {
+        var holder = buildExportContainer();
+        var w, h, html;
+        try {
+            w = Math.ceil(holder.scrollWidth) || 1200;
+            h = Math.ceil(holder.scrollHeight) || 800;
+            // Offscreen-позиционирование нельзя сериализовать (контент
+            // уедет за вьюпорт при серверном рендере) — чистим до outerHTML.
+            holder.style.position = 'static';
+            holder.style.left = 'auto';
+            holder.style.top = 'auto';
+            html = holder.outerHTML;
+        } finally {
+            if (holder && holder.parentNode) holder.parentNode.removeChild(holder);
+        }
+        return { html: html, w: w, h: h };
+    }
+
+    function renderExportCanvas(cb, opts) {
+        opts = opts || {};
         frappe.dom.freeze(__('Рендеринг') + '…');
         setTimeout(function () {
             var holder = null;
@@ -1086,7 +1166,11 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
                 img.onload = function () {
                     try {
                         var canvas = document.createElement('canvas');
-                        var scale = Math.min(2, 4000 / Math.max(w, h)); // до 2x, но не шире 4000px
+                        // Ограничения canvas: сторона ≤ 8192px, площадь ≤ ~100 МП;
+                        // меньше 1× не уменьшаем (лучше большая картинка, чем мыло)
+                        var userScale = opts.scale || 2;
+                        var cap = Math.min(8192 / Math.max(w, h), 100000000 / (w * h));
+                        var scale = Math.max(1, Math.min(userScale, cap));
                         canvas.width = Math.round(w * scale);
                         canvas.height = Math.round(h * scale);
                         var ctx = canvas.getContext('2d');
@@ -1126,24 +1210,33 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
         }, 3000);
     }
 
-    function exportPNG() {
-        var btn = document.getElementById('export-png');
-        btn.disabled = true;
+    // Общий растровый экспорт: format 'PNG' | 'JPG', scale 1..4, quality 0..1 (JPG)
+    function exportRaster(format, scale, quality) {
+        var btn = document.getElementById('export-btn');
+        if (btn) btn.disabled = true;
+        function done() { if (btn) btn.disabled = false; }
         renderExportCanvas(function (err, canvas, holder) {
             try {
                 if (err) throw err;
+                var mime = format === 'JPG' ? 'image/jpeg' : 'image/png';
+                var ext = format === 'JPG' ? '.jpg' : '.png';
                 canvas.toBlob(function (blob) {
-                    if (!blob) throw new Error('PNG blob failed');
-                    downloadBlob(blob, 'orgchart-' + frappe.datetime.get_today() + '.png');
+                    if (!blob) {
+                        frappe.msgprint(__('Не удалось сформировать изображение'));
+                        cleanupExport(holder);
+                        done();
+                        return;
+                    }
+                    downloadBlob(blob, 'orgchart-' + frappe.datetime.get_today() + ext);
                     cleanupExport(holder);
-                    btn.disabled = false;
-                }, 'image/png');
+                    done();
+                }, mime, quality);
             } catch (e) {
-                frappe.msgprint(__('Не удалось сформировать PNG') + ': ' + e.message);
+                frappe.msgprint(__('Не удалось сформировать изображение') + ': ' + e.message);
                 cleanupExport(holder);
-                btn.disabled = false;
+                done();
             }
-        });
+        }, { scale: scale || 2 });
     }
 
     // Минимальный PDF-генератор: одна страница A4 landscape, изображение
@@ -1206,9 +1299,11 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
         return bytes;
     }
 
+    // Растровый PDF (крайний случай): используется как откат, если
+    // сервер не смог сформировать векторный PDF.
     function exportPDF() {
-        var btn = document.getElementById('export-pdf');
-        btn.disabled = true;
+        var btn = document.getElementById('export-btn');
+        if (btn) btn.disabled = true;
         renderExportCanvas(function (err, canvas, holder) {
             try {
                 if (err) throw err;
@@ -1218,17 +1313,186 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
                 downloadBlob(new Blob([pdfBytes], { type: 'application/pdf' }),
                     'orgchart-' + frappe.datetime.get_today() + '.pdf');
                 cleanupExport(holder);
-                btn.disabled = false;
+                if (btn) btn.disabled = false;
             } catch (e) {
                 frappe.msgprint(__('Не удалось сформировать PDF') + ': ' + e.message);
                 cleanupExport(holder);
-                btn.disabled = false;
+                if (btn) btn.disabled = false;
             }
         });
     }
 
-    $('#export-png').off('click').on('click', exportPNG);
-    $('#export-pdf').off('click').on('click', exportPDF);
+    // === Векторный PDF: контейнер экспорта уходит на сервер ===
+    // (headless-Chromium по CDP → wkhtmltopdf), ответ — blob c PDF.
+    // Ответ бинарный, поэтому fetch(), а не frappe.call.
+    function fetchVectorPDF() {
+        var payload = buildExportHTML();
+        return fetch('/api/method/' + EXPORT_PDF_METHOD, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Frappe-CSRF-Token': frappe.csrf_token
+            },
+            body: JSON.stringify({ html: payload.html, width: payload.w, height: payload.h })
+        }).then(function (resp) {
+            if (!resp.ok) {
+                return resp.text().then(function (txt) {
+                    var msg = '';
+                    try {
+                        var j = JSON.parse(txt);
+                        msg = j.exception || j.exc_message || j._server_messages || j.message || '';
+                        if (typeof msg === 'string' && msg.charAt(0) === '[') {
+                            try {
+                                msg = JSON.parse(msg).map(function (m) { return m.message || m; }).join(' ');
+                            } catch (e2) { /* оставляем как есть */ }
+                        }
+                    } catch (e) {
+                        msg = (txt || '').slice(0, 300);
+                    }
+                    throw new Error(msg || ('HTTP ' + resp.status));
+                }, function () {
+                    throw new Error('HTTP ' + resp.status);
+                });
+            }
+            return resp.blob();
+        }).then(function (blob) {
+            // Защита: вместо PDF может прийти JSON-ошибка с HTTP 200
+            if (!blob || blob.size < 500 || (blob.type || '').indexOf('json') >= 0) {
+                throw new Error(__('пустой ответ сервера'));
+            }
+            return blob;
+        });
+    }
+
+    function exportVectorPDF() {
+        frappe.dom.freeze(__('Формирование векторного PDF') + '…');
+        fetchVectorPDF()
+            .then(function (blob) {
+                frappe.dom.unfreeze();
+                downloadBlob(blob, 'orgchart-' + frappe.datetime.get_today() + '.pdf');
+            })
+            .catch(function (err) {
+                frappe.dom.unfreeze();
+                // Сервер не смог (нет Chromium/wkhtmltopdf) — откат на растровый PDF,
+                // чтобы юзер в любом случае получил файл.
+                frappe.msgprint({
+                    title: __('Векторный PDF недоступен'),
+                    indicator: 'orange',
+                    message: __('Не удалось сформировать векторный PDF на сервере') +
+                        ' (' + ((err && err.message) ? err.message : __('неизвестная ошибка')) + '). ' +
+                        __('Сохранён растровый PDF (текст не выделяется).') + '<br><br>' +
+                        __('Чтобы включить векторный экспорт, выполните на сервере') +
+                        ': <code>bench setup-chromium</code>'
+                });
+                exportPDF();
+            });
+    }
+
+    // === Диалог экспорта: формат / разрешение / качество ===
+    // Открыта одна кнопка «Экспорт». Диалог создаётся ОДИН раз и
+    // переиспользуется: frappe не убирает wrapper скрытого диалога из
+    // DOM, поэтому новый Dialog на каждый клик копил бы мусор в body.
+    // Последний выбранный формат запоминается в localStorage.
+    var EXPORT_FMT_KEY = 'org_chart_mtp_export_format';
+    var exportDialog = null;
+
+    function openExportDialog() {
+        var savedFmt = null;
+        try { savedFmt = window.localStorage.getItem(EXPORT_FMT_KEY); } catch (e) { /* приватный режим */ }
+        var fmt = ['PNG', 'JPG', 'PDF'].indexOf(savedFmt) >= 0 ? savedFmt : 'PNG';
+        var dims = getExportDimensions();
+        var scaleOptions = buildScaleOptions(dims);
+        if (!exportDialog) exportDialog = buildExportDialog(scaleOptions);
+
+        // подписи разрешений актуальны для текущего размера дерева
+        exportDialog.set_df_property('scale', 'options', scaleOptions);
+        exportDialog.set_value('format', fmt); // триггерит syncExportFields
+        exportDialog.set_value('scale', '2');
+        exportDialog.set_value('quality', '0.92');
+        exportDialog.show();
+        syncExportFields();
+    }
+
+    function buildScaleOptions(dims) {
+        return [1, 2, 3, 4].map(function (s) {
+            return {
+                label: s + '\u00d7 \u2014 ' +
+                    Math.round(dims.w * s).toLocaleString() + ' \u00d7 ' +
+                    Math.round(dims.h * s).toLocaleString() + ' ' + __('пкс'),
+                value: String(s)
+            };
+        });
+    }
+
+    function buildExportDialog(scaleOptions) {
+        var d = new frappe.ui.Dialog({
+            title: __('Экспорт оргчарта'),
+            fields: [
+                {
+                    fieldname: 'format', label: __('Формат'), fieldtype: 'Select',
+                    options: [
+                        { label: __('PNG — растровое, без потерь'), value: 'PNG' },
+                        { label: __('JPG — растровое, компактный файл'), value: 'JPG' },
+                        { label: __('PDF — векторный, текст выделяется'), value: 'PDF' }
+                    ],
+                    default: 'PNG',
+                    description: __('PDF формируется на сервере (Chromium) и содержит живой текст; растровые форматы рисуются в браузере.')
+                },
+                {
+                    fieldname: 'scale', label: __('Разрешение'), fieldtype: 'Select',
+                    options: scaleOptions, default: '2',
+                    description: __('Итоговый размер изображения в пикселях')
+                },
+                {
+                    fieldname: 'quality', label: __('Качество JPG'), fieldtype: 'Select',
+                    options: [
+                        { label: __('85% — минимальный размер файла'), value: '0.85' },
+                        { label: __('92% — сбалансированное'), value: '0.92' },
+                        { label: __('96% — максимальное качество'), value: '0.96' }
+                    ],
+                    default: '0.92'
+                }
+            ],
+            primary_action_label: __('Скачать'),
+            primary_action: function (values) {
+                d.hide();
+                try { window.localStorage.setItem(EXPORT_FMT_KEY, values.format); } catch (e) { /* приватный режим */ }
+                if (values.format === 'PDF') {
+                    exportVectorPDF();
+                } else {
+                    exportRaster(
+                        values.format,
+                        parseInt(values.scale, 10) || 2,
+                        parseFloat(values.quality) || 0.92
+                    );
+                }
+            }
+        });
+        d.fields_dict.format.df.onchange = syncExportFields;
+        return d;
+    }
+
+    // Поля НЕ прячем через df.hidden при создании диалога: v16 не
+    // рендерит input у скрытого поля (toggle потом нечего показывать).
+    // Вместо этого рендерим все поля, а видимость синхронизируем
+    // вручную (df.hidden + toggle) — надёжнее depends_on.
+    function syncExportFields() {
+        var d = exportDialog;
+        if (!d) return;
+        var cur = d.fields_dict.format.get_value() || 'PNG';
+        setFieldVisible(d, 'scale', cur !== 'PDF');
+        setFieldVisible(d, 'quality', cur === 'JPG');
+    }
+
+    function setFieldVisible(dlg, name, show) {
+        var f = dlg.fields_dict[name];
+        if (!f) return;
+        if (f.df) f.df.hidden = !show;
+        var w = f.$wrapper || (f.wrapper ? $(f.wrapper) : null);
+        if (w) w.toggle(show);
+    }
+
+    $('#export-btn').off('click').on('click', openExportDialog);
 
     // === Утилиты ===
     function escapeHtml(text) {

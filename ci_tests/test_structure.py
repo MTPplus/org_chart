@@ -59,11 +59,12 @@ class TestInstallCustomFields(unittest.TestCase):
             "custom_color",
             "custom_functions",
             "custom_kra",
-            "custom_metrics",
             "custom_wiki_url",
             "custom_folder_url",
         }
         self.assertTrue(expected <= fields, f"нет полей: {expected - fields}")
+        # JSON-поле метрик удалено в v0.3 (метрики = Goal с custom_department)
+        self.assertNotIn("custom_metrics", fields)
 
     def test_field_definitions_valid(self):
         """У каждого поля есть fieldname/fieldtype/label/insert_after."""

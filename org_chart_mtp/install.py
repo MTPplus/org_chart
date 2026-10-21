@@ -1,10 +1,14 @@
 """
 Установка org_chart_mtp: кастомные поля создаются автоматически.
 
-Поля Department (цвет/функции/ЦКП/wiki/папка/метрики) и Goal (отдел)
-создаются через create_custom_fields при install и повторно проверяются
-при каждом migrate — то есть добавление полей применяется миграцией
-автоматически, без ручных действий.
+Поля Department (цвет/функции/ЦКП/wiki/папка) и Goal (отдел) создаются
+через create_custom_fields при install и повторно проверяются при каждом
+migrate — то есть добавление полей применяется миграцией автоматически,
+без ручных действий.
+
+Цели и «метрики» отделов — это обычные Goal из hrms, закреплённые за
+отделом полем Goal.custom_department (см. патч v0.3: кастомное
+JSON-поле метрик Department.custom_metrics удалено).
 """
 import frappe
 from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
@@ -45,18 +49,10 @@ DEPARTMENT_CUSTOM_FIELDS = {
                         "По умолчанию показывается на плитке оргчарта.",
                 ),
                 dict(
-                        fieldname="custom_metrics",
-                        label="Метрики",
-                        fieldtype="JSON",
-                        insert_after="custom_kra",
-                        description='Метрики отдела в JSON: [{"name":"...","current":"...","target":"...","unit":"...","progress":N}]. '
-                        "Видны только HR и руководителям.",
-                ),
-                dict(
                         fieldname="custom_wiki_url",
                         label="Wiki (ссылка)",
                         fieldtype="Data",
-                        insert_after="custom_metrics",
+                        insert_after="custom_kra",
                         description="Ссылка на wiki-страницу отдела.",
                 ),
                 dict(
@@ -79,7 +75,8 @@ GOAL_CUSTOM_FIELDS = {
                         options="Department",
                         insert_after="kra",
                         description="Отдел, к которому относится цель. Используется оргчартом "
-                        "для блока «Цели отдела».",
+                        "для раздела целей отдела (вместо отдельного поля метрик: "
+                        "закрепите Goal за отделом здесь).",
                 ),
         ]
 }

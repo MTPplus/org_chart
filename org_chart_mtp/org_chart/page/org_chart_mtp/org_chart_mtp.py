@@ -10,7 +10,7 @@ Org Chart Page — бэкенд org_chart_mtp.
         настройке Org Chart Settings.hr_designations
   * Руководитель (Manager):
       - у сотрудника есть подчинённые (рекурсивно по Employee.reports_to);
-      - видит цели/метрики себя и своей ветки подчинённых,
+      - видит цели себя и своей ветки подчинённых,
         цели отделов своих подчинённых
   * Рядовой сотрудник:
       - видит структуру, контакты и ЦКП/функции отделов (публично),
@@ -18,6 +18,10 @@ Org Chart Page — бэкенд org_chart_mtp.
 
 Цвет плитки отдела берётся ТОЛЬКО из Department.custom_color (hex-строка).
 Если поле не заполнено — нейтральный #475569.
+
+Цели/«метрики» отделов — это обычные Goal из hrms, закреплённые за
+отделом полем Goal.custom_department (создаётся install.py). Отдельного
+JSON-поля метрик больше нет (удалено в v0.3).
 
 Кастомные поля создаются автоматически при install/migrate (install.py).
 """
@@ -109,7 +113,6 @@ def _get_org_data_impl(perms=None):
                 "custom_wiki_url",
                 "custom_folder_url",
                 "custom_kra",
-                "custom_metrics",
         ]
         for cf in custom_fields:
                 if frappe.db.has_column("Department", cf):
@@ -143,13 +146,6 @@ def _get_org_data_impl(perms=None):
         # === 1b. Цели отделов (Goal.custom_department) — со скоупом ===
         visible_depts = _visible_departments(perms, departments)
         dept_goals = _get_dept_goals(visible_depts)
-
-        # === 1c. Метрики — ЦЕЛЫЙ отдел без права их не получает ===
-        # ЦКП (kra_title/kra_description) остаётся публичным для всех,
-        # метрики вырезаются сервером: HR — все отделы, руководитель —
-        # отделы своей ветки, рядовой сотрудник — никаких.
-        metrics_depts = _metrics_allowed_depts(perms, departments, visible_depts)
-        _strip_metrics(departments, metrics_depts)
 
         # === 2. Сотрудники (структура и контакты публичны) ===
         employees = frappe.get_all(
@@ -288,40 +284,18 @@ def _visible_departments(perms, departments):
         return [d["name"] for d in departments if d["name"] in dept_names]
 
 
-def _metrics_allowed_depts(perms, departments, visible_depts):
-        """Отделы, чьи МЕТРИКИ видит пользователь.
-
-        Правило «ЦКП — всем, метрики — по праву»:
-          * HR — все отделы;
-          * руководитель — отделы своей ветки (visible_depts);
-          * рядовой сотрудник — пустое множество.
-        """
-        if perms["is_hr"]:
-                return {d["name"] for d in departments}
-        if perms["is_manager"]:
-                return set(visible_depts)
-        return set()
-
-
-def _strip_metrics(departments, allowed_depts):
-        """Вырезать custom_metrics у отделов вне allowed_depts.
-
-        Выполняется на сервере ДО отдачи клиенту: метрики не должны
-        попадать в браузер пользователей без права, даже если интерфейс
-        их не показывает.
-        """
-        for dept in departments:
-                if dept.get("name") not in allowed_depts:
-                        dept.pop("custom_metrics", None)
-
-
 # ---------------------------------------------------------------------------
 # Данные со скоупом
 # ---------------------------------------------------------------------------
 
 
 def _get_dept_goals(dept_names):
-        """Цели отделов из Goal.custom_department."""
+        """Цели отделов из Goal.custom_department — «метрики» отдела.
+
+        Это обычные Goal из hrms, закреплённые за отделом полем
+        custom_department (создаётся install.py). Каждая цель в панели —
+        ссылка на документ Goal.
+        """
         dept_goals = {}
         if not dept_names:
                 return dept_goals
@@ -337,9 +311,13 @@ def _get_dept_goals(dept_names):
                                 "progress",
                                 "start_date",
                                 "end_date",
+                                "status",
+                                "employee",
+                                "employee_name",
                                 "custom_department",
                         ],
                         filters={"custom_department": ["in", dept_names]},
+                        order_by="creation asc",
                         limit_page_length=0,
                 ):
                         dept_goals.setdefault(goal.custom_department, []).append(goal)
@@ -382,9 +360,17 @@ def _get_attachments(perms, departments):
 
 def _get_goals(perms):
         """Цели сотрудников: HR — все; руководитель — своя ветка; иначе — свои."""
-        goal_fields = ["name", "goal_name", "employee", "kra", "progress", "start_date", "end_date"]
-        if frappe.db.has_column("Goal", "description"):
-                goal_fields.append("description")
+        goal_fields = [
+                "name",
+                "goal_name",
+                "employee",
+                "employee_name",
+                "kra",
+                "progress",
+                "status",
+                "start_date",
+                "end_date",
+        ]
 
         filters = {}
         if not perms["is_hr"]:
@@ -429,7 +415,11 @@ def _get_settings():
 
 @frappe.whitelist()
 def get_department_details(department_name):
-        """Детали отдела: сотрудники, вложения, метрики — с учётом прав."""
+        """Детали отдела: сотрудники и вложения — с учётом прав.
+
+        Цели отдела (бывш. «метрики») — обычные Goal из hrms с полем
+        custom_department; отдаем их списком вместе с деталями.
+        """
         perms = _get_permissions()
 
         dept = frappe.get_doc("Department", department_name)
@@ -459,30 +449,16 @@ def get_department_details(department_name):
                 limit_page_length=500,
         )
 
-        # Метрики: HR — любой отдел; руководитель — отделы своей ветки;
-        # рядовой сотрудник — ничего (ЦКП при этом виден всем).
-        can_view_metrics = perms["is_hr"] or (
-                perms["is_manager"]
-                and department_name in _visible_departments(perms, [{"name": department_name}])
-        )
-
-        metrics = None
-        if can_view_metrics and dept.get("custom_metrics"):
-                try:
-                        metrics = json.loads(dept.custom_metrics)
-                except (json.JSONDecodeError, TypeError):
-                        metrics = None
-
-        dept_data = dept.as_dict()
-        if not can_view_metrics:
-                dept_data.pop("custom_metrics", None)
+        # Цели отдела: HR — любой отдел; руководитель — отделы своей ветки
+        dept_goals = []
+        if department_name in _visible_departments(perms, [{"name": department_name}]):
+                dept_goals = _get_dept_goals([department_name]).get(department_name, [])
 
         return {
-                "department": dept_data,
+                "department": dept.as_dict(),
                 "attachments": attachments,
                 "employees": employees,
-                "metrics": metrics,
-                "can_view_metrics": can_view_metrics,
+                "goals": dept_goals,
         }
 
 
@@ -525,7 +501,17 @@ def get_employee_details(employee_name):
         try:
                 goals = frappe.get_all(
                         "Goal",
-                        fields=["name", "goal_name", "kra", "progress", "start_date", "end_date"],
+                        fields=[
+                                "name",
+                                "goal_name",
+                                "employee",
+                                "employee_name",
+                                "kra",
+                                "progress",
+                                "status",
+                                "start_date",
+                                "end_date",
+                        ],
                         filters={"employee": employee_name},
                         limit_page_length=100,
                 )

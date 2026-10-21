@@ -3,6 +3,7 @@
 
 [post_model_sync]
 # Патчи после миграции DocType'ов
+org_chart_mtp.patches.v0_3_remove_metrics
 
 [post_fixture_sync]
 # Патчи после синхронизации фикстур и кастомизаций

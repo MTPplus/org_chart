@@ -34,10 +34,9 @@ after_migrate = "org_chart_mtp.install.after_migrate"
 # Doc Events
 # ------------
 # Инвалидация кэша get_org_data (Redis, per-scope) при изменении источников
-# данных + серверная валидация JSON-метрик отдела (UI-валидация поля).
+# данных (Department / Employee / Goal / File / Settings).
 doc_events = {
         "Department": {
-                "validate": "org_chart_mtp.api.events.validate_department",
                 "on_update": "org_chart_mtp.api.events.invalidate_cache",
                 "on_trash": "org_chart_mtp.api.events.invalidate_cache",
                 "on_rename": "org_chart_mtp.api.events.invalidate_cache",
