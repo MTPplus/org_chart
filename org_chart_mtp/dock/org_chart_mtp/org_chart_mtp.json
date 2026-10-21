@@ -1,0 +1,20 @@
+{
+ "app": "org_chart_mtp",
+ "doctype": "Dock",
+ "items": [
+  {
+   "added": 1,
+   "hidden": 0,
+   "icon": "org-chart-soft",
+   "link_to": "Org Chart",
+   "link_type": "Sidebar",
+   "title": "Оргструктура"
+  }
+ ],
+ "modified": "2026-10-21 00:00:00.000000",
+ "modified_by": "Administrator",
+ "name": "org_chart_mtp",
+ "owner": "Administrator",
+ "standard": 1,
+ "user": ""
+}

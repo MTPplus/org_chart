@@ -1,0 +1,45 @@
+{
+ "content_type": "Website",
+ "creation": "2026-10-21 00:00:00.000000",
+ "docstatus": 0,
+ "doctype": "Page",
+ "icon": "org-chart-soft",
+ "idx": 0,
+ "modified": "2026-10-21 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Org Chart",
+ "name": "org_chart_mtp",
+ "owner": "Administrator",
+ "page_name": "org_chart_mtp",
+ "roles": [
+  {
+   "role": "HR Manager",
+   "doctype": "Page Role",
+   "parent": "org_chart_mtp",
+   "parentfield": "roles",
+   "parenttype": "Page",
+   "idx": 1
+  },
+  {
+   "role": "HR User",
+   "doctype": "Page Role",
+   "parent": "org_chart_mtp",
+   "parentfield": "roles",
+   "parenttype": "Page",
+   "idx": 2
+  },
+  {
+   "role": "Employee",
+   "doctype": "Page Role",
+   "parent": "org_chart_mtp",
+   "parentfield": "roles",
+   "parenttype": "Page",
+   "idx": 3
+  }
+ ],
+ "script": "org_chart_mtp.js",
+ "standard": "Yes",
+ "style": null,
+ "system_page": 0,
+ "title": "Оргструктура компании"
+}

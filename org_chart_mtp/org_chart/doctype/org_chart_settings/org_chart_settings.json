@@ -1,0 +1,85 @@
+{
+ "actions": [],
+ "creation": "2026-10-21 00:00:00.000000",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "card_default",
+  "panel_default",
+  "show_employees",
+  "section_break_4",
+  "hr_designations"
+ ],
+ "fields": [
+  {
+   "default": "ЦКП",
+   "description": "Что показывается на плитке отдела в оргчарте по умолчанию.",
+   "fieldname": "card_default",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Содержимое плитки (по умолчанию)",
+   "options": "\u0426\u041a\u041f\n\u0424\u0443\u043d\u043a\u0446\u0438\u0438",
+   "reqd": 1
+  },
+  {
+   "default": "Функции",
+   "description": "Что показывается в боковой панели отдела по умолчанию.",
+   "fieldname": "panel_default",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Содержимое боковой панели (по умолчанию)",
+   "options": "\u0426\u041a\u041f\n\u0424\u0443\u043d\u043a\u0446\u0438\u0438",
+   "reqd": 1
+  },
+  {
+   "default": "1",
+   "description": "Показывать чипы сотрудников на плитках отделов.",
+   "fieldname": "show_employees",
+   "fieldtype": "Check",
+   "label": "Показывать сотрудников на плитках"
+  },
+  {
+   "fieldname": "section_break_4",
+   "fieldtype": "Section Break",
+   "label": "Права видимости"
+  },
+  {
+   "description": "Должности (Employee.designation) с полным доступом к целям и метрикам всех сотрудников — по одной на строку. Роли HR Manager и System Manager дают полный доступ автоматически. Руководители видят цели своей ветки (reports_to) без записи здесь.",
+   "fieldname": "hr_designations",
+   "fieldtype": "Small Text",
+   "label": "HR-должности (полный доступ)"
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "issingle": 1,
+ "links": [],
+ "modified": "2026-10-21 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Org Chart",
+ "name": "Org Chart Settings",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "email": 1,
+   "print": 1,
+   "read": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "create": 1,
+   "email": 1,
+   "print": 1,
+   "read": 1,
+   "role": "HR Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}

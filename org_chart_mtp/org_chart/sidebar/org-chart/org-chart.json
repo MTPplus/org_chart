@@ -1,0 +1,48 @@
+{
+ "doctype": "Sidebar",
+ "header_icon": "org-chart-soft",
+ "items": [
+  {
+   "icon": "org-chart-duotone",
+   "label": "Оргструктура компании",
+   "link_to": "org_chart_mtp",
+   "link_type": "Page",
+   "type": "Link"
+  },
+  {
+   "collapsible": 1,
+   "label": "Справочники",
+   "type": "Section Break"
+  },
+  {
+   "label": "Отделы",
+   "link_to": "Department",
+   "link_type": "DocType",
+   "type": "Link"
+  },
+  {
+   "label": "ЦКП (KRA)",
+   "link_to": "KRA",
+   "link_type": "DocType",
+   "type": "Link"
+  },
+  {
+   "collapsible": 1,
+   "label": "Настройки",
+   "type": "Section Break"
+  },
+  {
+   "label": "Настройки оргчарта",
+   "link_to": "Org Chart Settings",
+   "link_type": "DocType",
+   "type": "Link"
+  }
+ ],
+ "modified": "2026-10-21 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Org Chart",
+ "name": "Org Chart",
+ "owner": "Administrator",
+ "standard": 1,
+ "title": "Org Chart"
+}

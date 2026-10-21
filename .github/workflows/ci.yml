@@ -1,0 +1,57 @@
+name: CI
+
+# Лёгкие статические тесты БЕЗ установки frappe/bench:
+# полная развёртка bench+erpnext+hrms в CI признана слишком
+# ресурсоёмкой — здесь только ручные проверки, описанные в ci_tests/.
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-org_chart_mtp-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static-tests:
+    name: Статические тесты (без bench)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Клонировать репозиторий
+        uses: actions/checkout@v4
+
+      - name: Настроить Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Настроить Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Синтаксис Python (компиляция всех модулей)
+        run: python ci_tests/check_py_compile.py
+
+      - name: Валидность всех JSON-файлов
+        run: python ci_tests/check_json_valid.py
+
+      - name: Синтаксис JavaScript (node --check)
+        run: python ci_tests/check_js_syntax.py
+
+      - name: Структура приложения и правила видимости
+        run: python -m unittest discover -s ci_tests -p "test_*.py" -v
+
+  smoke-hint:
+    name: Подсказка (полные тесты — локально)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Вывести команды полного прогона
+        run: |
+          echo "Полные интеграционные тесты (требуют bench+site) запускаются вручную:"
+          echo "  bench --site <site> install-app org_chart_mtp"
+          echo "  bench --site <site> run-tests --app org_chart_mtp"
+          echo "Подробности — README.md, раздел «Тесты»."
