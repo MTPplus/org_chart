@@ -21,24 +21,56 @@ Org Chart Page — бэкенд org_chart_mtp.
 
 Кастомные поля создаются автоматически при install/migrate (install.py).
 """
+import hashlib
 import json
 
 import frappe
 
+# _ (перевод) вызывается как frappe._ — чтобы не ломать статические
+# тесты со стаб-модулем frappe (см. ci_tests/frappe_stub.py)
+
 NEUTRAL_COLOR = "#475569"
 FULL_ACCESS_ROLES = {"HR Manager", "System Manager"}
+
+# Кэш get_org_data (Redis, per-scope). TTL — страховка: основная
+# инвалидация — по doc_events (см. api/events.py и hooks.py).
+CACHE_PREFIX = "org_chart_data"
+CACHE_TTL = 300  # сек
 
 
 def get_context(context):
         """Контекст шаблона страницы."""
-        context.title = "Оргструктура компании"
+        context.title = frappe._("Оргструктура компании")
 
 
 @frappe.whitelist()
 def get_org_data():
-        """Все данные оргчарта одним запросом — с учётом прав доступа."""
+        """Все данные оргчарта одним запросом — с учётом прав доступа.
+
+        Результат кэшируется в Redis per-scope (ключ = хеш прав видимости),
+        инвалидация — doc_events на Department/Employee/Goal/File/Settings.
+        """
         try:
-                return _get_org_data_impl()
+                perms = _get_permissions()
+                cache_key = _cache_key(perms)
+                try:
+                        cached = frappe.cache().get_value(cache_key)
+                except Exception:
+                        cached = None
+                if cached:
+                        return json.loads(cached)
+
+                result = _get_org_data_impl(perms)
+
+                try:
+                        frappe.cache().set_value(
+                                cache_key,
+                                json.dumps(result, default=str),
+                                expires_in_sec=CACHE_TTL,
+                        )
+                except Exception:
+                        pass  # кэш не критичен — отдаём без записи
+                return result
         except Exception as e:
                 frappe.log_error(f"org_chart get_org_data error: {e}")
                 return {
@@ -53,8 +85,15 @@ def get_org_data():
                 }
 
 
-def _get_org_data_impl():
-        perms = _get_permissions()
+def _cache_key(perms):
+        """Ключ кэша per-scope: хеш полного набора прав видимости."""
+        payload = json.dumps(perms, sort_keys=True, ensure_ascii=False)
+        return f"{CACHE_PREFIX}::{hashlib.md5(payload.encode('utf-8')).hexdigest()}"
+
+
+def _get_org_data_impl(perms=None):
+        if perms is None:
+                perms = _get_permissions()
 
         # === 1. Департаменты ===
         dept_fields = [

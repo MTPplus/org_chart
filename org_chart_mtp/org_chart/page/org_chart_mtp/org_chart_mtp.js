@@ -3,11 +3,15 @@
 //  URL: /desk/org_chart_mtp
 //
 //  Vanilla JS (без React/Vue), работает внутри Frappe Desk.
-//  Данные: frappe.call → org_chart_mtp.py:get_org_data
+//  Данные: frappe.call → org_chart_mtp.py:get_org_data (Redis-кэш на сервере)
 //
 //  Возможности:
-//    - Рекурсивная иерархия любой глубины
+//    - Рекурсивная иерархия любой глубины (depthMap — precompute, O(n))
 //    - Зум к курсору (колесо мыши + кнопки), панорамирование
+//    - Pointer events: мышь + тач/планшет единообразно;
+//      зажатие ЛКМ на плитке = пан, короткий клик = открыть плитку
+//    - Поиск по отделам/сотрудникам с автоскроллом и подсветкой узла
+//    - Экспорт PNG и PDF всего оргчарта
 //    - Плитка отдела: ЦКП (по умолчанию) или Функции — переключается
 //      в шапке и в Org Chart Settings; выбор запоминается
 //    - Боковая панель: Функции (по умолчанию) или ЦКП — переключается
@@ -16,6 +20,8 @@
 //    - Клик по сотруднику → панель сотрудника
 //    - Сворачивание/разворачивание подотделов
 //    - Права: HR/руководитель видят цели и метрики, рядовой — только свои
+//    - i18n: строки обёрнуты в __() — переводятся через стандартные
+//      CSV-файлы переводов Frappe при необходимости
 // =====================================================================
 
 var APP_NAME = 'org_chart_mtp';
@@ -23,6 +29,8 @@ var METHOD_PATH = 'org_chart_mtp.org_chart.page.org_chart_mtp.org_chart_mtp.get_
 var NEUTRAL_COLOR = '#475569';
 var TILE_KEY = 'org_chart_mtp_tile_mode';
 var PANEL_KEY = 'org_chart_mtp_panel_mode';
+var PAN_THRESHOLD = 5;    // px: превышение = pan, иначе — клик
+var PAN_CLICK_GUARD = 200; // мс: клики сразу после пана игнорируются
 
 frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
     var page = frappe.ui.make_app_page({
@@ -41,11 +49,17 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
         tileMode: 'ЦКП',       // 'ЦКП' | 'Функции' — что на плитке
         panelMode: 'Функции',  // 'ЦКП' | 'Функции' — что в боковой панели
         collapsed: new Set(),
+        depthMap: null,        // precompute: name → depth (O(n) вместо O(n²))
         scale: 1,
         tx: 0,
         ty: 0,
         isPanning: false,
         panStart: { x: 0, y: 0, tx: 0, ty: 0 },
+        isPointerDown: false,
+        panMoved: false,
+        activePointerId: null,
+        lastPanEnd: 0,        // timestamp: гард «клик сразу после пана»
+        searchTerm: '',
         hasCentered: false,
     };
 
@@ -142,35 +156,67 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
             .org-section-title span { font-size: 12px; font-weight: 600; color: #111827; text-transform: uppercase; }
             .org-goal-due svg { width: 11px; height: 11px; vertical-align: -1px; margin-right: 2px; }
             .org-panel-employees .chip svg { width: 12px; height: 12px; flex-shrink: 0; }
+            .org-canvas-wrapper { touch-action: none; }
+            #org-side-panel { touch-action: auto; }
+            .org-search { position: relative; }
+            .org-search-input { width: 240px; padding: 6px 10px 6px 28px; border: 1px solid #e5e7eb; border-radius: 6px; font-size: 12px; color: #111827; background: white; outline: none; transition: border-color 0.15s, box-shadow 0.15s; }
+            .org-search-input:focus { border-color: #60a5fa; box-shadow: 0 0 0 3px rgba(37,99,235,0.12); }
+            .org-search-icon { position: absolute; left: 8px; top: 50%; transform: translateY(-50%); color: #9ca3af; display: flex; pointer-events: none; }
+            .org-search-icon svg { width: 14px; height: 14px; }
+            .org-search-dropdown { position: absolute; top: calc(100% + 4px); left: 0; width: 320px; max-height: 320px; overflow-y: auto; background: white; border: 1px solid #e5e7eb; border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,0.14); z-index: 60; display: none; }
+            .org-search-dropdown.open { display: block; }
+            .org-search-group { padding: 6px 10px 2px; font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: #9ca3af; }
+            .org-search-item { padding: 8px 12px; cursor: pointer; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+            .org-search-item:hover { background: #eff6ff; }
+            .org-search-item .title { font-size: 12px; color: #111827; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+            .org-search-item .subtitle { font-size: 10px; color: #9ca3af; max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+            .org-search-empty { padding: 12px; font-size: 12px; color: #9ca3af; text-align: center; }
+            .org-export-controls { display: flex; align-items: center; gap: 4px; border: 1px solid #e5e7eb; border-radius: 6px; background: white; }
+            .org-export-controls button { padding: 6px 10px; border: none; background: none; cursor: pointer; color: #4b5563; font-size: 11px; font-weight: 600; }
+            .org-export-controls button:hover { background: #f3f4f6; color: #111827; }
+            .org-export-controls button:disabled { opacity: 0.5; cursor: wait; }
+            .org-node, .org-emp-chip, .org-collapse-btn { -webkit-tap-highlight-color: transparent; }
+            @keyframes orgPulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(37,99,235,0); } 50% { box-shadow: 0 0 0 10px rgba(37,99,235,0.45); } }
+            .org-node.org-highlight { animation: orgPulse 0.9s ease-in-out 2; border-color: #2563eb; z-index: 5; }
+            .org-emp-chip.org-highlight { animation: orgPulse 0.9s ease-in-out 2; border-color: #2563eb; background: #eff6ff; color: #1d4ed8; }
         </style>
         <div class="org-root">
             <div class="org-header">
                 <div style="display:flex;align-items:center;">
-                    <h1>Оргструктура</h1>
+                    <h1>${__('Оргструктура')}</h1>
                     <span class="stats" id="org-stats"></span>
                 </div>
+                <div class="org-search">
+                    <span class="org-search-icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></span>
+                    <input class="org-search-input" id="org-search-input" type="text" autocomplete="off" placeholder="${__('Поиск отдела или сотрудника')}…">
+                    <div class="org-search-dropdown" id="org-search-dropdown"></div>
+                </div>
                 <div class="org-header-controls">
-                    <div class="org-switcher" title="Что показывать на плитке отдела">
-                        <span class="org-switcher-label">Плитка:</span>
-                        <button class="org-switch-btn" data-tile-mode="ЦКП">ЦКП</button>
-                        <button class="org-switch-btn" data-tile-mode="Функции">Функции</button>
+                    <div class="org-switcher" title="${__('Что показывать на плитке отдела')}">
+                        <span class="org-switcher-label">${__('Плитка')}:</span>
+                        <button class="org-switch-btn" data-tile-mode="ЦКП">${__('ЦКП')}</button>
+                        <button class="org-switch-btn" data-tile-mode="Функции">${__('Функции')}</button>
                     </div>
-                    <div class="org-switcher" title="Что показывать в боковой панели отдела">
-                        <span class="org-switcher-label">Панель:</span>
-                        <button class="org-switch-btn" data-panel-mode="ЦКП">ЦКП</button>
-                        <button class="org-switch-btn" data-panel-mode="Функции">Функции</button>
+                    <div class="org-switcher" title="${__('Что показывать в боковой панели отдела')}">
+                        <span class="org-switcher-label">${__('Панель')}:</span>
+                        <button class="org-switch-btn" data-panel-mode="ЦКП">${__('ЦКП')}</button>
+                        <button class="org-switch-btn" data-panel-mode="Функции">${__('Функции')}</button>
+                    </div>
+                    <div class="org-export-controls">
+                        <button id="export-png" title="${__('Скачать PNG')}">PNG</button>
+                        <button id="export-pdf" title="${__('Скачать PDF')}">PDF</button>
                     </div>
                     <div class="org-zoom-controls">
-                        <button id="zoom-out" title="Уменьшить">−</button>
+                        <button id="zoom-out" title="${__('Уменьшить')}">−</button>
                         <span class="zoom-value" id="zoom-value">100%</span>
-                        <button id="zoom-in" title="Увеличить">+</button>
-                        <button id="zoom-reset" title="Сбросить" style="border-left:1px solid #e5e7eb;">⤢</button>
+                        <button id="zoom-in" title="${__('Увеличить')}">+</button>
+                        <button id="zoom-reset" title="${__('Сбросить')}" style="border-left:1px solid #e5e7eb;">⤢</button>
                     </div>
                 </div>
             </div>
             <div class="org-canvas-wrapper" id="org-canvas-wrapper">
                 <div class="org-canvas" id="org-canvas"></div>
-                <div class="org-hint" id="org-hint">Колесо мыши — зум к курсору · перетаскивание — пан · клик по карточке — детали</div>
+                <div class="org-hint" id="org-hint">${__('Колесо мыши — зум к курсору · перетаскивание — пан · клик по карточке — детали')}</div>
                 <div class="org-side-panel" id="org-side-panel" style="display:none;"></div>
             </div>
         </div>
@@ -178,6 +224,7 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
 
     // === SVG иконки ===
     var ICONS = {
+        search: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>',
         folder: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>',
         book: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>',
         target: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg>',
@@ -232,6 +279,7 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
                 state.data = r.message;
                 state.permissions = r.message.permissions || {};
                 state.settings = r.message.settings || state.settings;
+                buildDepthMap();
                 // Порядок приоритета: выбор пользователя (localStorage) → настройки → ЦКП/Функции
                 var savedTile = window.localStorage.getItem(TILE_KEY);
                 state.tileMode = savedTile || state.settings.card_default || 'ЦКП';
@@ -239,22 +287,22 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
                 state.panelMode = savedPanel || state.settings.panel_default || 'Функции';
                 updateSwitcherUI();
                 $('#org-stats').text(
-                    state.data.departments.length + ' узлов · ' +
-                    state.data.employees.length + ' сотрудников'
+                    state.data.departments.length + ' ' + __('узлов') + ' · ' +
+                    state.data.employees.length + ' ' + __('сотрудников')
                 );
                 renderTree();
                 centerContent();
             } else {
                 $('#org-canvas').html('<div style="text-align:center;padding:40px;color:#ef4444;">' +
-                    '<p>Ошибка: данные не получены от сервера.</p>' +
-                    '<p style="font-size:11px;color:#9ca3af;">Проверьте, что метод <code>' + METHOD_PATH + '</code> существует</p>' +
+                    '<p>' + __('Ошибка: данные не получены от сервера.') + '</p>' +
+                    '<p style="font-size:11px;color:#9ca3af;">' + __('Проверьте, что метод') + ' <code>' + METHOD_PATH + '</code> ' + __('существует') + '</p>' +
                     '</div>');
             }
         },
         error: function (err) {
             $('#org-canvas').html('<div style="text-align:center;padding:40px;color:#ef4444;">' +
-                '<p>Ошибка загрузки данных: ' + (err && err.message ? err.message : 'неизвестная') + '</p>' +
-                '<p style="font-size:11px;color:#9ca3af;">Приложение: <code>' + APP_NAME + '</code>, метод: <code>' + METHOD_PATH + '</code></p>' +
+                '<p>' + __('Ошибка загрузки данных') + ': ' + (err && err.message ? err.message : __('неизвестная')) + '</p>' +
+                '<p style="font-size:11px;color:#9ca3af;">' + __('Приложение') + ': <code>' + APP_NAME + '</code>, ' + __('метод') + ': <code>' + METHOD_PATH + '</code></p>' +
                 '</div>');
         },
     });
@@ -307,7 +355,7 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
         var html = '';
         if (label === 'ЦКП') {
             if (node.kra_title) {
-                html += '<div class="org-node-section"><div class="org-node-section-label">ЦКП</div>';
+                html += '<div class="org-node-section"><div class="org-node-section-label">' + __('ЦКП') + '</div>';
                 html += '<div class="org-node-ckp-title">' + escapeHtml(node.kra_title) + '</div>';
                 if (node.kra_description) {
                     var short = node.kra_description.length > 140
@@ -320,24 +368,24 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
                 // Нет ЦКП — показываем функции как fallback
                 var fns = parseFunctions(node);
                 if (fns.length > 0) {
-                    html += '<div class="org-node-section"><div class="org-node-section-label">Функции</div><ul class="org-node-functions">';
+                    html += '<div class="org-node-section"><div class="org-node-section-label">' + __('Функции') + '</div><ul class="org-node-functions">';
                     fns.forEach(function (fn) { html += '<li>' + escapeHtml(fn) + '</li>'; });
                     html += '</ul></div>';
                 } else {
-                    html += '<div class="org-node-section"><div class="org-node-section-label">ЦКП</div><div class="org-node-empty">не задано</div></div>';
+                    html += '<div class="org-node-section"><div class="org-node-section-label">' + __('ЦКП') + '</div><div class="org-node-empty">' + __('не задано') + '</div></div>';
                 }
             }
         } else {
             var fns2 = parseFunctions(node);
             if (fns2.length > 0) {
-                html += '<div class="org-node-section"><div class="org-node-section-label">Функции</div><ul class="org-node-functions">';
+                html += '<div class="org-node-section"><div class="org-node-section-label">' + __('Функции') + '</div><ul class="org-node-functions">';
                 fns2.forEach(function (fn) { html += '<li>' + escapeHtml(fn) + '</li>'; });
                 html += '</ul></div>';
             } else if (node.kra_title) {
                 // Нет функций — показываем ЦКП как fallback
-                html += '<div class="org-node-section"><div class="org-node-section-label">ЦКП</div><div class="org-node-ckp-title">' + escapeHtml(node.kra_title) + '</div></div>';
+                html += '<div class="org-node-section"><div class="org-node-section-label">' + __('ЦКП') + '</div><div class="org-node-ckp-title">' + escapeHtml(node.kra_title) + '</div></div>';
             } else {
-                html += '<div class="org-node-section"><div class="org-node-section-label">Функции</div><div class="org-node-empty">не задано</div></div>';
+                html += '<div class="org-node-section"><div class="org-node-section-label">' + __('Функции') + '</div><div class="org-node-empty">' + __('не задано') + '</div></div>';
             }
         }
         return html;
@@ -420,7 +468,7 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
                 html += '</div>';
                 html += '</div>';
             } else {
-                html += '<div class="org-collapsed-label">Свернуто: ' + children.length + '</div>';
+                html += '<div class="org-collapsed-label">' + __('Свернуто') + ': ' + children.length + '</div>';
             }
         }
         html += '</div>';
@@ -429,7 +477,7 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
 
     function renderTree() {
         if (!state.data || state.data.departments.length === 0) {
-            $('#org-canvas').html('<div style="text-align:center;padding:40px;color:#9ca3af;">Нет данных. Создайте Department в ERPNext.</div>');
+            $('#org-canvas').html('<div style="text-align:center;padding:40px;color:#9ca3af;">' + __('Нет данных. Создайте Department в ERPNext.') + '</div>');
             return;
         }
         var roots = state.data.departments.filter(function (d) {
@@ -445,21 +493,29 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
     }
 
     // === Обработчики ===
+    // Гард: клик сразу после пана — это продолжение жеста, игнорируем
+    function isPanClick() {
+        return Date.now() - state.lastPanEnd < PAN_CLICK_GUARD;
+    }
+
     function attachEventHandlers() {
         $('[data-node-id]').off('click').on('click', function (e) {
             e.stopPropagation();
+            if (isPanClick()) return;
             var nodeId = $(this).data('node-id');
             var node = state.data.departments.find(function (d) { return d.name === nodeId; });
             if (node) openNodePanel(node);
         });
         $('[data-emp-id]').off('click').on('click', function (e) {
             e.stopPropagation();
+            if (isPanClick()) return;
             var empId = $(this).data('emp-id');
             var emp = state.data.employees.find(function (em) { return em.name === empId; });
             if (emp) openEmployeePanel(emp);
         });
         $('[data-collapse-id]').off('click').on('click', function (e) {
             e.stopPropagation();
+            if (isPanClick()) return;
             var id = $(this).data('collapse-id');
             if (state.collapsed.has(id)) state.collapsed.delete(id);
             else state.collapsed.add(id);
@@ -496,30 +552,30 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
         html += '<div class="org-panel-header" style="background:linear-gradient(135deg,' + color + '08 0%,' + color + '15 100%);">';
         html += '<div style="display:flex;align-items:flex-start;flex:1;min-width:0;">';
         html += '<div class="icon" style="background:' + color + '">' + ICONS.folder + '</div>';
-        html += '<div class="title-block"><div class="type-label">' + (getNodeType(depth) === 'company' ? 'Компания' : getNodeType(depth) === 'department' ? 'Отдел' : 'Секция') + '</div>';
+        html += '<div class="title-block"><div class="type-label">' + (getNodeType(depth) === 'company' ? __('Компания') : getNodeType(depth) === 'department' ? __('Отдел') : __('Секция')) + '</div>';
         html += '<h2>' + escapeHtml(node.department_name || node.name) + '</h2></div></div>';
         html += '<button class="org-panel-close" id="panel-close">' + ICONS.close + '</button></div>';
 
         // Содержимое панели: ЦКП или Функции (переключается, по умолчанию Функции)
         if (state.panelMode === 'ЦКП') {
-            html += '<div class="org-panel-ckp"><div class="label">ЦКП (KRA)</div><div class="text"><strong>' + (ckp ? escapeHtml(ckp) : '<span style="color:#9ca3af;font-weight:400;">не задано</span>') + '</strong>';
+            html += '<div class="org-panel-ckp"><div class="label">' + __('ЦКП (KRA)') + '</div><div class="text"><strong>' + (ckp ? escapeHtml(ckp) : '<span style="color:#9ca3af;font-weight:400;">' + __('не задано') + '</span>') + '</strong>';
             if (ckpDesc) html += '<br>' + escapeHtml(ckpDesc);
             html += '</div></div>';
         } else {
-            html += '<div class="org-panel-ckp"><div class="label">Функции</div><div class="text">';
+            html += '<div class="org-panel-ckp"><div class="label">' + __('Функции') + '</div><div class="text">';
             if (functions.length > 0) {
                 html += '<ul class="org-node-functions">';
                 functions.forEach(function (fn) { html += '<li>' + escapeHtml(fn) + '</li>'; });
                 html += '</ul>';
             } else {
-                html += '<span style="color:#9ca3af;">не задано</span>';
+                html += '<span style="color:#9ca3af;">' + __('не задано') + '</span>';
             }
             html += '</div></div>';
         }
 
         // Сотрудники
         if (empList.length > 0) {
-            html += '<div class="org-panel-employees"><div class="label">Сотрудники (' + empList.length + ')</div><div class="chips">';
+            html += '<div class="org-panel-employees"><div class="label">' + __('Сотрудники') + ' (' + empList.length + ')</div><div class="chips">';
             empList.forEach(function (emp) {
                 html += '<button class="chip" data-emp-id="' + escapeHtml(emp.name) + '">' + ICONS.user + escapeHtml(emp.employee_name || emp.name) + '</button>';
             });
@@ -528,10 +584,10 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
 
         // Вкладки
         html += '<div class="org-panel-tabs">';
-        html += '<button class="org-tab ' + (state.activeTab === 'folder' ? 'active' : '') + '" data-tab="folder">' + ICONS.folder + 'Папка</button>';
+        html += '<button class="org-tab ' + (state.activeTab === 'folder' ? 'active' : '') + '" data-tab="folder">' + ICONS.folder + __('Папка') + '</button>';
         html += '<button class="org-tab ' + (state.activeTab === 'wiki' ? 'active' : '') + '" data-tab="wiki">' + ICONS.book + 'Wiki</button>';
         if (canViewMetrics) {
-            html += '<button class="org-tab ' + (state.activeTab === 'goals' ? 'active' : '') + '" data-tab="goals">' + ICONS.target + 'Цели и метрики</button>';
+            html += '<button class="org-tab ' + (state.activeTab === 'goals' ? 'active' : '') + '" data-tab="goals">' + ICONS.target + __('Цели и метрики') + '</button>';
         }
         html += '</div>';
 
@@ -563,17 +619,44 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
         });
     }
 
+    // === Precompute глубин: O(n) вместо O(n²) в getDepth ===
+    function buildDepthMap() {
+        state.depthMap = {};
+        var byName = {};
+        state.data.departments.forEach(function (d) { byName[d.name] = d; });
+        state.data.departments.forEach(function (d) {
+            var depth = 0;
+            var cur = d;
+            var guard = 0;
+            while (cur && cur.parent_department && guard++ < 50) {
+                depth++;
+                cur = byName[cur.parent_department];
+            }
+            state.depthMap[d.name] = depth;
+        });
+    }
+
     function getDepth(node) {
-        var depth = 0;
-        var current = node;
-        while (current && current.parent_department) {
-            depth++;
-            current = state.data.departments.find(function (d) {
-                return d.name === current.parent_department;
-            });
-            if (depth > 20) break;
+        if (state.depthMap && Object.prototype.hasOwnProperty.call(state.depthMap, node.name)) {
+            return state.depthMap[node.name];
         }
-        return depth;
+        return 0;
+    }
+
+    // === Общий рендер списка целей (отдел + сотрудник) ===
+    function renderGoalItems(goals) {
+        var html = '';
+        goals.forEach(function (g) {
+            html += '<div class="org-goal-item">';
+            html += '<div class="org-goal-text">' + escapeHtml(g.goal_name) + '</div>';
+            if (g.end_date) html += '<div class="org-goal-due">' + ICONS.calendar + ' ' + __('Срок') + ': ' + escapeHtml(g.end_date) + '</div>';
+            if (g.progress !== undefined && g.progress !== null && g.progress !== '') {
+                html += '<div class="org-progress-bar" style="margin-top:6px;"><div class="org-progress-fill" style="width:' + g.progress + '%;"></div></div>';
+                html += '<div style="font-size:10px;color:#6b7280;margin-top:2px;">' + __('Прогресс') + ': ' + g.progress + '%</div>';
+            }
+            html += '</div>';
+        });
+        return html;
     }
 
     function renderFolderTab(attachments, folderUrl) {
@@ -582,17 +665,17 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
             html += '<a class="org-wiki-link" href="' + escapeHtml(folderUrl) + '" target="_blank" style="margin-bottom:12px;">' +
                 '<div style="display:flex;align-items:center;gap:12px;">' +
                 '<div style="width:32px;height:32px;border-radius:6px;background:#fef3c7;display:flex;align-items:center;justify-content:center;flex-shrink:0;color:#d97706;">' + ICONS.folder + '</div>' +
-                '<div style="flex:1;min-width:0;"><div style="font-size:12px;font-weight:500;color:#92400e;">Папка отдела</div><div style="font-size:10px;color:#b45309;overflow:hidden;text-overflow:ellipsis;">' + escapeHtml(folderUrl) + '</div></div>' +
+                '<div style="flex:1;min-width:0;"><div style="font-size:12px;font-weight:500;color:#92400e;">' + __('Папка отдела') + '</div><div style="font-size:10px;color:#b45309;overflow:hidden;text-overflow:ellipsis;">' + escapeHtml(folderUrl) + '</div></div>' +
                 ICONS.link + '</div></a>';
         }
         if (attachments.length === 0) {
-            html += '<div class="org-restricted">' + ICONS.folder + '<p style="margin-top:8px;">Вложений нет</p></div>';
+            html += '<div class="org-restricted">' + ICONS.folder + '<p style="margin-top:8px;">' + __('Вложений нет') + '</p></div>';
             return html;
         }
-        html += '<p style="font-size:12px;color:#6b7280;margin-bottom:12px;">Файлов: ' + attachments.length + '</p>';
+        html += '<p style="font-size:12px;color:#6b7280;margin-bottom:12px;">' + __('Файлов') + ': ' + attachments.length + '</p>';
         attachments.forEach(function (att) {
-            var sizeStr = att.file_size ? Math.round(att.file_size / 1024) + ' КБ' : '';
-            html += '<a class="org-file-item" href="' + att.file_url + '" target="_blank">';
+            var sizeStr = att.file_size ? Math.round(att.file_size / 1024) + ' ' + __('КБ') : '';
+            html += '<a class="org-file-item" href="' + escapeHtml(att.file_url) + '" target="_blank">';
             html += '<div class="org-file-icon">' + ICONS.file + '</div>';
             html += '<div style="flex:1;min-width:0;"><div class="org-file-name">' + escapeHtml(att.file_name) + '</div><div class="org-file-meta">' + sizeStr + '</div></div>';
             html += ICONS.link + '</a>';
@@ -601,40 +684,31 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
     }
 
     function renderWikiTab(wikiUrl) {
-        return '<a class="org-wiki-link" href="' + wikiUrl + '" target="_blank">' +
+        return '<a class="org-wiki-link" href="' + escapeHtml(wikiUrl) + '" target="_blank">' +
             '<div style="display:flex;align-items:center;gap:12px;">' +
             '<div style="width:32px;height:32px;border-radius:6px;background:#dbeafe;display:flex;align-items:center;justify-content:center;flex-shrink:0;color:#2563eb;">' + ICONS.book + '</div>' +
-            '<div style="flex:1;min-width:0;"><div style="font-size:12px;font-weight:500;color:#1e3a8a;">Wiki отдела</div><div style="font-size:10px;color:#1d4ed8;overflow:hidden;text-overflow:ellipsis;">' + escapeHtml(wikiUrl) + '</div></div>' +
+            '<div style="flex:1;min-width:0;"><div style="font-size:12px;font-weight:500;color:#1e3a8a;">' + __('Wiki отдела') + '</div><div style="font-size:10px;color:#1d4ed8;overflow:hidden;text-overflow:ellipsis;">' + escapeHtml(wikiUrl) + '</div></div>' +
             ICONS.link + '</div></a>';
     }
 
     function renderGoalsMetricsTab(node, metrics) {
         var canViewMetrics = (state.permissions && state.permissions.is_hr) || (state.permissions && state.permissions.is_manager);
         if (!canViewMetrics) {
-            return '<div class="org-restricted">' + ICONS.target + '<p style="margin-top:8px;">Нет прав для просмотра целей и метрик</p></div>';
+            return '<div class="org-restricted">' + ICONS.target + '<p style="margin-top:8px;">' + __('Нет прав для просмотра целей и метрик') + '</p></div>';
         }
 
         var deptGoals = (state.data.dept_goals && state.data.dept_goals[node.name]) || [];
         var html = '';
 
-        html += '<div class="org-section-title">' + ICONS.target + '<span>Цели отдела (' + deptGoals.length + ')</span></div>';
+        html += '<div class="org-section-title">' + ICONS.target + '<span>' + __('Цели отдела') + ' (' + deptGoals.length + ')</span></div>';
         if (deptGoals.length === 0) {
-            html += '<p style="font-size:11px;color:#9ca3af;font-style:italic;margin-bottom:16px;">Целей нет. Создайте Goal с «Отдел» = ' + escapeHtml(node.name) + '</p>';
+            html += '<p style="font-size:11px;color:#9ca3af;font-style:italic;margin-bottom:16px;">' + __('Целей нет. Создайте Goal с полем «Отдел»') + ' = ' + escapeHtml(node.name) + '</p>';
         } else {
-            deptGoals.forEach(function (g) {
-                html += '<div class="org-goal-item">';
-                html += '<div class="org-goal-text">' + escapeHtml(g.goal_name) + '</div>';
-                if (g.end_date) html += '<div class="org-goal-due">' + ICONS.calendar + ' Срок: ' + g.end_date + '</div>';
-                if (g.progress) {
-                    html += '<div class="org-progress-bar" style="margin-top:6px;"><div class="org-progress-fill" style="width:' + g.progress + '%;"></div></div>';
-                    html += '<div style="font-size:10px;color:#6b7280;margin-top:2px;">Прогресс: ' + g.progress + '%</div>';
-                }
-                html += '</div>';
-            });
+            html += renderGoalItems(deptGoals);
         }
 
         if (metrics && metrics.length > 0) {
-            html += '<div class="org-section-title" style="margin-top:16px;">' + ICONS.trend + '<span>Метрики (' + metrics.length + ')</span></div>';
+            html += '<div class="org-section-title" style="margin-top:16px;">' + ICONS.trend + '<span>' + __('Метрики') + ' (' + metrics.length + ')</span></div>';
             metrics.forEach(function (m) {
                 html += '<div class="org-metric-item">';
                 html += '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px;">';
@@ -671,27 +745,27 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
         html += '<div class="org-panel-header" style="background:linear-gradient(135deg,#eff6ff 0%,#f3e8ff 100%);">';
         html += '<div style="display:flex;align-items:center;">';
         html += '<div style="width:40px;height:40px;border-radius:50%;background:#2563eb;color:white;display:flex;align-items:center;justify-content:center;font-weight:600;font-size:14px;flex-shrink:0;">' + initials + '</div>';
-        html += '<div class="title-block"><div class="type-label">Сотрудник</div><h2><a href="/app/employee/' + encodeURIComponent(emp.name) + '" target="_blank" style="color:#2563eb;text-decoration:none;" onmouseover="this.style.textDecoration=\'underline\';" onmouseout="this.style.textDecoration=\'none\';">' + escapeHtml(emp.employee_name || emp.name) + '</a></h2><p style="font-size:12px;color:#6b7280;margin:2px 0 0;">' + escapeHtml(emp.designation || '') + '</p></div>';
+        html += '<div class="title-block"><div class="type-label">' + __('Сотрудник') + '</div><h2><a href="/app/employee/' + encodeURIComponent(emp.name) + '" target="_blank" style="color:#2563eb;text-decoration:none;" onmouseover="this.style.textDecoration=\'underline\';" onmouseout="this.style.textDecoration=\'none\';">' + escapeHtml(emp.employee_name || emp.name) + '</a></h2><p style="font-size:12px;color:#6b7280;margin:2px 0 0;">' + escapeHtml(emp.designation || '') + '</p></div>';
         html += '</div><button class="org-panel-close" id="panel-close">' + ICONS.close + '</button></div>';
 
         if (canViewContacts && (emp.user_id || emp.cell_number)) {
             html += '<div style="padding:10px 16px;background:#f9fafb;border-bottom:1px solid #f3f4f6;font-size:12px;">';
-            if (emp.user_id) html += '<div style="display:flex;margin-bottom:4px;"><span style="color:#9ca3af;min-width:60px;">Email:</span><span style="color:#111827;word-break:break-all;">' + escapeHtml(emp.user_id) + '</span></div>';
-            if (emp.cell_number) html += '<div style="display:flex;margin-bottom:4px;"><span style="color:#9ca3af;min-width:60px;">Телефон:</span><span style="color:#111827;">' + escapeHtml(emp.cell_number) + '</span></div>';
-            html += '<div style="display:flex;margin-bottom:4px;"><span style="color:#9ca3af;min-width:60px;">Отдел:</span><span style="color:#111827;">' + escapeHtml(emp.department || '—') + '</span></div>';
+            if (emp.user_id) html += '<div style="display:flex;margin-bottom:4px;"><span style="color:#9ca3af;min-width:60px;">' + __('Email') + ':</span><span style="color:#111827;word-break:break-all;">' + escapeHtml(emp.user_id) + '</span></div>';
+            if (emp.cell_number) html += '<div style="display:flex;margin-bottom:4px;"><span style="color:#9ca3af;min-width:60px;">' + __('Телефон') + ':</span><span style="color:#111827;">' + escapeHtml(emp.cell_number) + '</span></div>';
+            html += '<div style="display:flex;margin-bottom:4px;"><span style="color:#9ca3af;min-width:60px;">' + __('Отдел') + ':</span><span style="color:#111827;">' + escapeHtml(emp.department || '—') + '</span></div>';
             html += '</div>';
         } else {
             html += '<div style="padding:10px 16px;background:#f9fafb;border-bottom:1px solid #f3f4f6;font-size:12px;">';
-            html += '<div style="display:flex;margin-bottom:4px;"><span style="color:#9ca3af;min-width:60px;">Отдел:</span><span style="color:#111827;">' + escapeHtml(emp.department || '—') + '</span></div>';
+            html += '<div style="display:flex;margin-bottom:4px;"><span style="color:#9ca3af;min-width:60px;">' + __('Отдел') + ':</span><span style="color:#111827;">' + escapeHtml(emp.department || '—') + '</span></div>';
             html += '</div>';
         }
 
         // Вкладки
         html += '<div class="org-panel-tabs">';
-        html += '<button class="org-tab ' + (state.activeTab === 'folder' ? 'active' : '') + '" data-tab="folder">' + ICONS.folder + 'Папка</button>';
+        html += '<button class="org-tab ' + (state.activeTab === 'folder' ? 'active' : '') + '" data-tab="folder">' + ICONS.folder + __('Папка') + '</button>';
         html += '<button class="org-tab ' + (state.activeTab === 'wiki' ? 'active' : '') + '" data-tab="wiki">' + ICONS.book + 'Wiki</button>';
         if (canViewGoals || isOwnProfile) {
-            html += '<button class="org-tab ' + (state.activeTab === 'goals' ? 'active' : '') + '" data-tab="goals">' + ICONS.target + 'Цели</button>';
+            html += '<button class="org-tab ' + (state.activeTab === 'goals' ? 'active' : '') + '" data-tab="goals">' + ICONS.target + __('Цели') + '</button>';
         }
         html += '</div>';
 
@@ -702,19 +776,10 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
             html += renderWikiTab('/app/Employee/' + encodeURIComponent(emp.name));
         } else if (state.activeTab === 'goals') {
             if (goals.length === 0) {
-                html += '<div class="org-restricted"><p>Целей нет</p></div>';
+                html += '<div class="org-restricted"><p>' + __('Целей нет') + '</p></div>';
             } else {
-                html += '<div class="org-section-title">' + ICONS.target + '<span>Цели (' + goals.length + ')</span></div>';
-                goals.forEach(function (g) {
-                    html += '<div class="org-goal-item">';
-                    html += '<div class="org-goal-text">' + escapeHtml(g.goal_name) + '</div>';
-                    if (g.end_date) html += '<div class="org-goal-due">' + ICONS.calendar + ' Срок: ' + g.end_date + '</div>';
-                    if (g.progress) {
-                        html += '<div class="org-progress-bar" style="margin-top:6px;"><div class="org-progress-fill" style="width:' + g.progress + '%;"></div></div>';
-                        html += '<div style="font-size:10px;color:#6b7280;margin-top:2px;">Прогресс: ' + g.progress + '%</div>';
-                    }
-                    html += '</div>';
-                });
+                html += '<div class="org-section-title">' + ICONS.target + '<span>' + __('Цели') + ' (' + goals.length + ')</span></div>';
+                html += renderGoalItems(goals);
             }
         }
         html += '</div>';
@@ -780,25 +845,390 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
         zoomAtPoint(mx, my, delta);
     }, { passive: false });
 
-    canvasWrapper.addEventListener('mousedown', function (e) {
-        if (e.target.closest('[data-no-pan]')) return;
-        e.preventDefault();
-        state.isPanning = true;
+    // === Панорамирование: pointer events (мышь + тач/планшет единообразно) ===
+    // Зажатие в ЛЮБОМ месте канваса (включая плитку) = пан;
+    // короткий клик без движения = действие (открыть плитку/чип/кнопку).
+    // Боковая панель не участвует в пане.
+    canvasWrapper.addEventListener('pointerdown', function (e) {
+        if (e.target.closest('#org-side-panel')) return;
+        if (e.pointerType === 'mouse' && e.button !== 0) return;
+        state.isPointerDown = true;
+        state.panMoved = false;
+        state.activePointerId = e.pointerId;
         state.panStart = { x: e.clientX, y: e.clientY, tx: state.tx, ty: state.ty };
-        canvasWrapper.classList.add('panning');
+        try { canvasWrapper.setPointerCapture(e.pointerId); } catch (err) { /* старые браузеры */ }
     });
-    document.addEventListener('mousemove', function (e) {
-        if (!state.isPanning) return;
+    canvasWrapper.addEventListener('pointermove', function (e) {
+        if (!state.isPointerDown || e.pointerId !== state.activePointerId) return;
         var dx = e.clientX - state.panStart.x;
         var dy = e.clientY - state.panStart.y;
+        if (!state.panMoved && Math.sqrt(dx * dx + dy * dy) < PAN_THRESHOLD) return;
+        state.panMoved = true;
+        state.isPanning = true;
+        canvasWrapper.classList.add('panning');
         state.tx = state.panStart.tx + dx;
         state.ty = state.panStart.ty + dy;
         applyTransform();
     });
-    document.addEventListener('mouseup', function () {
+    function endPan(e) {
+        if (!state.isPointerDown) return;
+        state.isPointerDown = false;
+        state.activePointerId = null;
+        if (state.panMoved) state.lastPanEnd = Date.now();
         state.isPanning = false;
+        state.panMoved = false;
         canvasWrapper.classList.remove('panning');
+    }
+    canvasWrapper.addEventListener('pointerup', endPan);
+    canvasWrapper.addEventListener('pointercancel', endPan);
+    canvasWrapper.addEventListener('lostpointercapture', endPan);
+
+    // === Поиск по отделам и сотрудникам ===
+    var searchInput = document.getElementById('org-search-input');
+    var searchDropdown = document.getElementById('org-search-dropdown');
+    var searchTimer = null;
+
+    searchInput.addEventListener('input', function () {
+        clearTimeout(searchTimer);
+        searchTimer = setTimeout(function () {
+            state.searchTerm = searchInput.value || '';
+            renderSearchDropdown();
+        }, 180);
     });
+    searchInput.addEventListener('focus', function () {
+        if ((searchInput.value || '').trim()) renderSearchDropdown();
+    });
+    document.addEventListener('click', function (e) {
+        if (!e.target.closest('.org-search')) closeSearchDropdown();
+    });
+
+    function closeSearchDropdown() {
+        searchDropdown.classList.remove('open');
+    }
+
+    function renderSearchDropdown() {
+        var term = (state.searchTerm || '').trim().toLowerCase();
+        if (!term || !state.data) { closeSearchDropdown(); return; }
+
+        var depts = state.data.departments.filter(function (d) {
+            return (d.department_name || '').toLowerCase().indexOf(term) >= 0
+                || (d.name || '').toLowerCase().indexOf(term) >= 0;
+        }).slice(0, 7);
+        var emps = state.data.employees.filter(function (emp) {
+            return (emp.employee_name || '').toLowerCase().indexOf(term) >= 0;
+        }).slice(0, 7);
+
+        var html = '';
+        if (depts.length > 0) {
+            html += '<div class="org-search-group">' + __('Отделы') + '</div>';
+            depts.forEach(function (d) {
+                html += '<div class="org-search-item" data-search-dept="' + escapeHtml(d.name) + '">' +
+                    '<span class="title">' + escapeHtml(d.department_name || d.name) + '</span>' +
+                    '<span class="subtitle">' + __('Отдел') + '</span></div>';
+            });
+        }
+        if (emps.length > 0) {
+            html += '<div class="org-search-group">' + __('Сотрудники') + '</div>';
+            emps.forEach(function (emp) {
+                html += '<div class="org-search-item" data-search-emp="' + escapeHtml(emp.name) + '">' +
+                    '<span class="title">' + escapeHtml(emp.employee_name || emp.name) + '</span>' +
+                    '<span class="subtitle">' + escapeHtml(emp.designation || '') + '</span></div>';
+            });
+        }
+        if (!html) {
+            html = '<div class="org-search-empty">' + __('Ничего не найдено') + '</div>';
+        }
+        searchDropdown.innerHTML = html;
+        searchDropdown.classList.add('open');
+
+        $('[data-search-dept]').off('click').on('click', function () {
+            var name = $(this).data('search-dept');
+            closeSearchDropdown();
+            searchInput.blur();
+            scrollToDepartment(name);
+        });
+        $('[data-search-emp]').off('click').on('click', function () {
+            var empId = $(this).data('search-emp');
+            closeSearchDropdown();
+            searchInput.blur();
+            scrollToEmployee(empId);
+        });
+    }
+
+    function cssEscape(value) {
+        if (window.CSS && CSS.escape) return CSS.escape(value);
+        return String(value).replace(/[^a-zA-Z0-9_-]/g, '\\$&');
+    }
+
+    function expandAncestors(deptName) {
+        // развернуть всех предков, чтобы узел стал виден в DOM
+        var byName = {};
+        state.data.departments.forEach(function (d) { byName[d.name] = d; });
+        var cur = byName[deptName];
+        var guard = 0;
+        while (cur && cur.parent_department && guard++ < 50) {
+            if (state.collapsed.has(cur.parent_department)) {
+                state.collapsed.delete(cur.parent_department);
+            }
+            cur = byName[cur.parent_department];
+        }
+    }
+
+    // Плавная анимация transform к целевым tx/ty/scale
+    function animateTransformTo(targetTx, targetTy, targetScale, done) {
+        var start = { tx: state.tx, ty: state.ty, scale: state.scale };
+        var t0 = performance.now();
+        var DURATION = 350;
+        function step(now) {
+            var t = Math.min(1, (now - t0) / DURATION);
+            var ease = t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t; // easeInOutQuad
+            state.tx = start.tx + (targetTx - start.tx) * ease;
+            state.ty = start.ty + (targetTy - start.ty) * ease;
+            state.scale = start.scale + (targetScale - start.scale) * ease;
+            applyTransform();
+            if (t < 1) requestAnimationFrame(step);
+            else if (done) done();
+        }
+        requestAnimationFrame(step);
+    }
+
+    function centerOnElement(el, highlightClass) {
+        if (!el) return;
+        var wrapRect = canvasWrapper.getBoundingClientRect();
+        var elRect = el.getBoundingClientRect();
+        var cx = elRect.left + elRect.width / 2;
+        var cy = elRect.top + elRect.height / 2;
+        var targetTx = state.tx + (wrapRect.width / 2 - cx);
+        var targetTy = state.ty + (wrapRect.height / 2 - cy);
+        animateTransformTo(targetTx, targetTy, state.scale, function () {
+            el.classList.add(highlightClass || 'org-highlight');
+            setTimeout(function () { el.classList.remove(highlightClass || 'org-highlight'); }, 2000);
+        });
+    }
+
+    function scrollToDepartment(deptName) {
+        var dept = state.data.departments.find(function (d) { return d.name === deptName; });
+        if (!dept) return;
+        expandAncestors(deptName);
+        renderTree();
+        requestAnimationFrame(function () {
+            var el = canvasWrapper.querySelector('[data-node-id="' + cssEscape(deptName) + '"]');
+            centerOnElement(el, 'org-highlight');
+        });
+    }
+
+    function scrollToEmployee(empId) {
+        var emp = state.data.employees.find(function (em) { return em.name === empId; });
+        if (!emp) return;
+        var deptName = emp.department;
+        if (deptName) {
+            expandAncestors(deptName);
+            renderTree();
+            requestAnimationFrame(function () {
+                var chip = canvasWrapper.querySelector('[data-emp-id="' + cssEscape(empId) + '"]');
+                if (chip) {
+                    centerOnElement(chip, 'org-highlight');
+                } else {
+                    // сотрудник без чипа (скрыт настройкой) — подсветим его отдел
+                    var el = canvasWrapper.querySelector('[data-node-id="' + cssEscape(deptName) + '"]');
+                    centerOnElement(el, 'org-highlight');
+                }
+            });
+        }
+    }
+
+    // === Экспорт: PNG и PDF ===
+    // Рендер полного дерева (без зума/пана) в изолированный контейнер,
+    // сериализация в SVG foreignObject → canvas → PNG / PDF.
+    function buildExportContainer() {
+        var source = document.getElementById('org-canvas');
+        var holder = document.createElement('div');
+        holder.setAttribute('xmlns', 'http://www.w3.org/1999/xhtml');
+        holder.style.cssText = 'position:absolute;left:-99999px;top:0;background:#f8fafc;padding:32px;box-sizing:border-box;';
+        var inner = document.createElement('div');
+        inner.style.cssText = 'position:relative;transform:none;';
+        // Клонируем детей канваса (сам .org-canvas несёт transform зума)
+        inner.innerHTML = source.innerHTML;
+        holder.appendChild(inner);
+        // Клонируем стили страницы (инлайн <style> в body корневого элемента страницы)
+        var styles = document.querySelectorAll('style');
+        for (var i = 0; i < styles.length; i++) {
+            if (styles[i].textContent && styles[i].textContent.indexOf('.org-node') >= 0) {
+                var st = document.createElement('style');
+                st.textContent = styles[i].textContent;
+                holder.insertBefore(st, holder.firstChild);
+            }
+        }
+        document.body.appendChild(holder);
+        return holder;
+    }
+
+    function renderExportCanvas(cb) {
+        frappe.dom.freeze(__('Рендеринг') + '…');
+        setTimeout(function () {
+            var holder = null;
+            try {
+                holder = buildExportContainer();
+                var w = Math.ceil(holder.scrollWidth) || 1200;
+                var h = Math.ceil(holder.scrollHeight) || 800;
+                // Убираем offscreen-позиционирование ДО сериализации:
+                // иначе контент рендерится за пределами foreignObject (пустой PNG).
+                holder.style.position = 'static';
+                holder.style.left = 'auto';
+                holder.style.top = 'auto';
+                var xml = new XMLSerializer().serializeToString(holder);
+                var svgStr = '<svg xmlns="http://www.w3.org/2000/svg" width="' + w + '" height="' + h + '">' +
+                    '<foreignObject x="0" y="0" width="100%" height="100%">' + xml + '</foreignObject></svg>';
+                // ВАЖНО: data: URL, а не blob: — Chrome помечает canvas как tainted
+                // после drawImage(blob-SVG с foreignObject), и toBlob падает.
+                var url = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svgStr);
+                var img = new Image();
+                img.onload = function () {
+                    try {
+                        var canvas = document.createElement('canvas');
+                        var scale = Math.min(2, 4000 / Math.max(w, h)); // до 2x, но не шире 4000px
+                        canvas.width = Math.round(w * scale);
+                        canvas.height = Math.round(h * scale);
+                        var ctx = canvas.getContext('2d');
+                        ctx.fillStyle = '#f8fafc';
+                        ctx.fillRect(0, 0, canvas.width, canvas.height);
+                        ctx.scale(scale, scale);
+                        ctx.drawImage(img, 0, 0);
+                        cb(null, canvas, holder);
+                    } catch (err) {
+                        cb(err, null, holder);
+                    }
+                };
+                img.onerror = function () {
+                    cb(new Error('foreignObject render failed'), null, holder);
+                };
+                img.src = url;
+            } catch (err) {
+                cb(err, null, holder);
+            }
+        }, 50);
+    }
+
+    function cleanupExport(holder) {
+        if (holder && holder.parentNode) holder.parentNode.removeChild(holder);
+        frappe.dom.unfreeze();
+    }
+
+    function downloadBlob(blob, filename) {
+        var a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(function () {
+            URL.revokeObjectURL(a.href);
+            a.remove();
+        }, 3000);
+    }
+
+    function exportPNG() {
+        var btn = document.getElementById('export-png');
+        btn.disabled = true;
+        renderExportCanvas(function (err, canvas, holder) {
+            try {
+                if (err) throw err;
+                canvas.toBlob(function (blob) {
+                    if (!blob) throw new Error('PNG blob failed');
+                    downloadBlob(blob, 'orgchart-' + frappe.datetime.get_today() + '.png');
+                    cleanupExport(holder);
+                    btn.disabled = false;
+                }, 'image/png');
+            } catch (e) {
+                frappe.msgprint(__('Не удалось сформировать PNG') + ': ' + e.message);
+                cleanupExport(holder);
+                btn.disabled = false;
+            }
+        });
+    }
+
+    // Минимальный PDF-генератор: одна страница A4 landscape, изображение
+    // вписано по центру (DCTDecode — JPEG без перекодирования).
+    function buildPdfFromJpeg(jpegBytes, imgW, imgH) {
+        var PAGE_W = 842, PAGE_H = 595; // A4 landscape, pt
+        var s = Math.min(PAGE_W / imgW, PAGE_H / imgH);
+        var dw = imgW * s, dh = imgH * s;
+        var x = (PAGE_W - dw) / 2;
+        var y = (PAGE_H - dh) / 2;
+
+        var content = 'q ' + dw.toFixed(2) + ' 0 0 ' + dh.toFixed(2) + ' ' + x.toFixed(2) + ' ' + y.toFixed(2) + ' cm /Im0 Do Q';
+        var chunks = [];
+        var offsets = [];
+        var pos = 0;
+
+        function push(s_) {
+            var bytes = (typeof s_ === 'string')
+                ? s_.split('').map(function (c) { return c.charCodeAt(0) & 0xff; })
+                : s_;
+            chunks.push(bytes);
+            pos += bytes.length;
+        }
+        function obj(n) {
+            offsets[n] = pos;
+            push(n + ' 0 obj\n');
+        }
+
+        push('%PDF-1.4\n');
+        obj(1); push('<< /Type /Catalog /Pages 2 0 R >>\nendobj\n');
+        obj(2); push('<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n');
+        obj(3); push('<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ' + PAGE_W + ' ' + PAGE_H + '] ' +
+            '/Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>\nendobj\n');
+        obj(4); push('<< /Length ' + content.length + ' >>\nstream\n' + content + '\nendstream\nendobj\n');
+        obj(5); push('<< /Type /XObject /Subtype /Image /Width ' + imgW + ' /Height ' + imgH +
+            ' /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ' + jpegBytes.length + ' >>\nstream\n');
+        push(jpegBytes);
+        push('\nendstream\nendobj\n');
+
+        var xrefPos = pos;
+        var xref = 'xref\n0 6\n0000000000 65535 f \n';
+        for (var i = 1; i <= 5; i++) {
+            xref += ('0000000000' + offsets[i]).slice(-10) + ' 00000 n \n';
+        }
+        push(xref + 'trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n' + xrefPos + '\n%%EOF');
+
+        var total = 0;
+        chunks.forEach(function (c) { total += c.length; });
+        var out = new Uint8Array(total);
+        var p = 0;
+        chunks.forEach(function (c) { out.set(c, p); p += c.length; });
+        return out;
+    }
+
+    function dataUrlToBytes(dataUrl) {
+        var b64 = dataUrl.split(',')[1];
+        var bin = window.atob(b64);
+        var bytes = new Uint8Array(bin.length);
+        for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        return bytes;
+    }
+
+    function exportPDF() {
+        var btn = document.getElementById('export-pdf');
+        btn.disabled = true;
+        renderExportCanvas(function (err, canvas, holder) {
+            try {
+                if (err) throw err;
+                var jpegUrl = canvas.toDataURL('image/jpeg', 0.92);
+                var jpegBytes = dataUrlToBytes(jpegUrl);
+                var pdfBytes = buildPdfFromJpeg(jpegBytes, canvas.width, canvas.height);
+                downloadBlob(new Blob([pdfBytes], { type: 'application/pdf' }),
+                    'orgchart-' + frappe.datetime.get_today() + '.pdf');
+                cleanupExport(holder);
+                btn.disabled = false;
+            } catch (e) {
+                frappe.msgprint(__('Не удалось сформировать PDF') + ': ' + e.message);
+                cleanupExport(holder);
+                btn.disabled = false;
+            }
+        });
+    }
+
+    $('#export-png').off('click').on('click', exportPNG);
+    $('#export-pdf').off('click').on('click', exportPDF);
 
     // === Утилиты ===
     function escapeHtml(text) {
