@@ -2,11 +2,15 @@
 
 Запуск (на тестовом сайте!):
     bench --site <site> execute org_chart_mtp.demo.make_demo_data
+    bench --site <site> execute org_chart_mtp.demo.make_demo_company2
 
-Создаёт: дерево отделов с цветами (custom_color), ЦКП (custom_kra → KRA),
-функциями и wiki-ссылками; сотрудников с иерархией reports_to;
-личные и отделские цели (Goal с custom_department — именно они показываются
-в разделе целей/метрик отдела). Повторный запуск пропускается, если данные уже есть.
+make_demo_data: дерево отделов с цветами (custom_color), ЦКП
+(custom_kra → KRA), функциями и wiki-ссылками; сотрудников с иерархией
+reports_to; личные и отделские цели (Goal с custom_department).
+Повторный запуск пропускается, если данные уже есть.
+
+make_demo_company2: вторая компания для демонстрации мультикомпанийности
+(селектор компаний в шапке оргчарта). Повторный запуск идемпотентен.
 """
 import frappe
 
@@ -183,4 +187,130 @@ def make_demo_data():
         print(
                 "org_chart_mtp: демо-данные созданы — 13 отделов, 16 сотрудников, 15 целей, "
                 f"цвета из палитры ({len(PALETTE)} оттенков), компания: {company}"
+        )
+
+
+# --- Вторая компания: демонстрация мультикомпанийности --------------------
+COMPANY2 = "МТП Холдинг"
+
+
+def make_demo_company2():
+        """Вторая компания с собственной веткой отделов и сотрудниками.
+
+        Нужна, чтобы показать селектор компаний в шапке оргчарта:
+        «Все компании» показывает общее дерево, выбор компании фильтрует
+        отделы/чипы/поиск по Department.company / Employee.company.
+        Идемпотентно: при существующей компании выход по маркеру.
+        """
+        if frappe.db.exists("Company", COMPANY2):
+                print(f"org_chart_mtp: компания {COMPANY2} уже существует, пропускаю")
+                return
+
+        company = (
+                frappe.get_doc(
+                        {
+                                "doctype": "Company",
+                                "company_name": COMPANY2,
+                                "abbr": "MTH",
+                                "country": "Russian Federation",
+                                "default_currency": "RUB",
+                                "chart_of_accounts": "Standard",
+                        }
+                )
+                .insert(ignore_permissions=True)
+                .name
+        )
+
+        def dept2(name, parent, is_group, color, functions=None):
+                return frappe.get_doc(
+                        {
+                                "doctype": "Department",
+                                "department_name": name,
+                                "company": company,
+                                "parent_department": parent or "",
+                                "is_group": is_group,
+                                "custom_color": color,
+                                "custom_functions": functions,
+                        }
+                ).insert(ignore_permissions=True).name
+
+        def employee2(first, last, designation, department, reports_to=None):
+                if not frappe.db.exists("Designation", designation):
+                        frappe.get_doc(
+                                {"doctype": "Designation", "designation_name": designation}
+                        ).insert(ignore_permissions=True)
+                return frappe.get_doc(
+                        {
+                                "doctype": "Employee",
+                                "naming_series": "MTP-DEMO-",
+                                "first_name": first,
+                                "last_name": last,
+                                "company": company,
+                                "designation": designation,
+                                "department": department,
+                                "reports_to": reports_to,
+                                "date_of_joining": "2025-02-10",
+                                "date_of_birth": "1988-04-20",
+                                "gender": "Female" if len(first) % 2 else "Male",
+                                "status": "Active",
+                                "cell_number": "+7 900 111-11-11",
+                        }
+                ).insert(ignore_permissions=True).name
+
+        holding = dept2(
+                "Холдинг: Администрация", None, 1, "#7c3aed",
+                functions="Управление холдингом\nM&A\nЮридическое сопровождение сделок",
+        )
+        legal = dept2(
+                "Юридическая служба", holding, 0, "#a855f7",
+                functions="Договоры\nСудебные споры\nКомплаенс",
+        )
+        security = dept2(
+                "Служба безопасности", holding, 0, "#4f46e5",
+                functions="Экономическая безопасность\nФизическая защита",
+        )
+
+        # ERPNext при создании компании сам создаёт визард-отделы
+        # (Accounts/Legal/…, переведённые) — для чистого демо отключаем их,
+        # оставляя только нашу ветку (disabled=1 скрывает из get_org_data)
+        for d in frappe.get_all(
+                "Department",
+                filters={"company": company, "disabled": 0},
+                pluck="name",
+        ):
+                if d not in (holding, legal, security):
+                        frappe.db.set_value("Department", d, "disabled", 1, update_modified=False)
+
+        ceo2 = employee2("Борис", "Холдингов", "Генеральный директор холдинга", holding)
+        jur = employee2("Вера", "Правдина", "Юрист", legal, reports_to=ceo2)
+        sec = employee2("Глеб", "Охранкин", "Руководитель СБ", security, reports_to=ceo2)
+
+        frappe.get_doc(
+                {
+                        "doctype": "Goal",
+                        "goal_name": "Холдинг: закрыть 3 сделки M&A",
+                        "employee": ceo2,
+                        "progress": 30,
+                        "status": "In Progress",
+                        "start_date": "2026-01-01",
+                        "end_date": "2026-12-31",
+                        "custom_department": holding,
+                }
+        ).insert(ignore_permissions=True)
+        frappe.get_doc(
+                {
+                        "doctype": "Goal",
+                        "goal_name": "Пройти аудит комплаенса",
+                        "employee": jur,
+                        "progress": 60,
+                        "status": "In Progress",
+                        "start_date": "2026-01-15",
+                        "end_date": "2026-06-30",
+                }
+        ).insert(ignore_permissions=True)
+
+        frappe.db.commit()
+        print(
+                f"org_chart_mtp: компания {COMPANY2} создана — 3 отдела, 3 сотрудника, "
+                "2 цели (для селектора мультикомпанийности)"
         )

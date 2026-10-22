@@ -23,6 +23,11 @@ Org Chart Page — бэкенд org_chart_mtp.
 отделом полем Goal.custom_department (создаётся install.py). Отдельного
 JSON-поля метрик больше нет (удалено в v0.3).
 
+Создание целей из оргчарта — create_goal: права «только HR или
+вышестоящий начальник» (см. докстринг метода). Мультикомпанийность:
+в ответе get_org_data приходит список companies + поле company у
+сотрудников; фильтрация дерева по компании — на клиенте.
+
 Кастомные поля создаются автоматически при install/migrate (install.py).
 """
 import hashlib
@@ -30,8 +35,9 @@ import json
 
 import frappe
 
-# _ (перевод) вызывается как frappe._ — чтобы не ломать статические
-# тесты со стаб-модулем frappe (см. ci_tests/frappe_stub.py)
+# _ (перевод) вызывается как frappe._, а утилиты — как frappe.utils.* —
+# чтобы не ломать статические тесты со стаб-модулем frappe
+# (см. ci_tests/frappe_stub.py; у него нет frappe.utils как подмодуля)
 
 NEUTRAL_COLOR = "#475569"
 FULL_ACCESS_ROLES = {"HR Manager", "System Manager"}
@@ -85,6 +91,9 @@ def get_org_data():
                         "dept_goals": {},
                         "permissions": _empty_permissions(),
                         "settings": _default_settings(),
+                        "companies": [],
+                        "goal_editable_depts": [],
+                        "goal_status_options": [],
                         "error": str(e),
                 }
 
@@ -147,7 +156,8 @@ def _get_org_data_impl(perms=None):
         visible_depts = _visible_departments(perms, departments)
         dept_goals = _get_dept_goals(visible_depts)
 
-        # === 2. Сотрудники (структура и контакты публичны) ===
+        # === 2. Сотрудники (структура и контакты публичны; company — для
+        # фильтра мультикомпанийности на клиенте) ===
         employees = frappe.get_all(
                 "Employee",
                 fields=[
@@ -162,6 +172,7 @@ def _get_org_data_impl(perms=None):
                         "date_of_joining",
                         "user_id",
                         "cell_number",
+                        "company",
                 ],
                 filters={"status": "Active"},
                 limit_page_length=0,
@@ -181,7 +192,40 @@ def _get_org_data_impl(perms=None):
                 "dept_goals": dept_goals,
                 "permissions": perms,
                 "settings": _get_settings(),
+                # Мультикомпанийность: список компаний для селектора
+                "companies": _get_companies(),
+                # Отделы, куда пользователь может добавлять цели
+                # (HR — все; руководитель — отделы своей ветки)
+                "goal_editable_depts": visible_depts,
+                # Опции статуса Goal из hrms (для диалога создания цели)
+                "goal_status_options": _get_goal_status_options(),
         }
+
+
+def _get_companies():
+        """Компании сайта — для селектора мультикомпанийности.
+
+        Имена публичны как и структура оргчарта (внутренний инструмент);
+        фильтрация данных по компании делается на клиенте по полям
+        Department.company / Employee.company.
+        """
+        try:
+                return frappe.get_all(
+                        "Company", pluck="name", order_by="name asc", limit_page_length=0
+                )
+        except Exception:
+                return []
+
+
+def _get_goal_status_options():
+        """Опции статуса Goal (doctype hrms) — единый источник правды."""
+        try:
+                field = frappe.get_meta("Goal").get_field("status")
+                if field and field.options:
+                        return [o.strip() for o in field.options.split("\n") if o.strip()]
+        except Exception:
+                pass
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -411,6 +455,89 @@ def _get_settings():
 # ---------------------------------------------------------------------------
 # Детальные представления (клик по плитке / сотруднику)
 # ---------------------------------------------------------------------------
+
+
+@frappe.whitelist()
+def create_goal(
+        goal_name=None,
+        employee=None,
+        custom_department=None,
+        status=None,
+        start_date=None,
+        end_date=None,
+        progress=None,
+):
+        """Создать Goal из оргчарта (кнопка «+ Добавить цель» в панелях).
+
+        Права (согласно требованиям: только HR или вышестоящий начальник):
+          * личная цель (employee, без отдела): HR или вышестоящий
+            руководитель сотрудника — сам себе сотрудник цель назначить
+            не может;
+          * цель отдела (custom_department): HR или руководитель ветки,
+            которой принадлежит отдел (отделы себя и подчинённых).
+
+        Сам Goal создаётся с ignore_permissions — проверку прав делаем здесь,
+        она строже стандартных прав doctype (роль Employee в hrms может
+        создавать Goal свободно, но оргчарт этого не разрешает).
+        """
+        perms = _get_permissions()
+
+        goal_name = (goal_name or "").strip()
+        employee = (employee or "").strip()
+        custom_department = (custom_department or "").strip()
+
+        if not goal_name:
+                frappe.throw(frappe._("Укажите название цели"))
+        if not employee:
+                frappe.throw(frappe._("Укажите сотрудника — владельца цели"))
+
+        if not perms["is_hr"]:
+                if custom_department:
+                        allowed = _visible_departments(perms, [{"name": custom_department}])
+                        if custom_department not in allowed:
+                                frappe.throw(
+                                        frappe._(
+                                                "Недостаточно прав: цели отделам назначает "
+                                                "HR или руководитель ветки"
+                                        ),
+                                        frappe.PermissionError,
+                                )
+                else:
+                        if employee == perms["current_employee"]:
+                                frappe.throw(
+                                        frappe._(
+                                                "Недостаточно прав: сотрудник не может "
+                                                "назначать цели самому себе"
+                                        ),
+                                        frappe.PermissionError,
+                                )
+                        if employee not in set(perms["visible_employee_ids"]):
+                                frappe.throw(
+                                        frappe._(
+                                                "Недостаточно прав: цели сотрудникам "
+                                                "назначает HR или вышестоящий руководитель"
+                                        ),
+                                        frappe.PermissionError,
+                                )
+
+        status = (status or "Pending").strip()
+        if status not in _get_goal_status_options():
+                status = "Pending"
+
+        doc = frappe.get_doc(
+                {
+                        "doctype": "Goal",
+                        "goal_name": goal_name,
+                        "employee": employee,
+                        "custom_department": custom_department or None,
+                        "status": status,
+                        "start_date": start_date or frappe.utils.today(),
+                        "end_date": end_date or None,
+                        "progress": frappe.utils.cint(progress) if progress not in (None, "") else 0,
+                }
+        )
+        doc.insert(ignore_permissions=True)
+        return {"name": doc.name, "goal_name": doc.goal_name}
 
 
 @frappe.whitelist()

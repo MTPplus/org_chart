@@ -37,6 +37,8 @@ after_migrate = "org_chart_mtp.install.after_migrate"
 # данных (Department / Employee / Goal / File / Settings).
 doc_events = {
         "Department": {
+                # hex-валидация Department.custom_color (цвет плитки)
+                "validate": "org_chart_mtp.api.events.validate_color",
                 "on_update": "org_chart_mtp.api.events.invalidate_cache",
                 "on_trash": "org_chart_mtp.api.events.invalidate_cache",
                 "on_rename": "org_chart_mtp.api.events.invalidate_cache",

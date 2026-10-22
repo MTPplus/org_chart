@@ -13,9 +13,20 @@
 //      (захват указателя — только после порога движения, иначе click
 //      по плитке ретаргетится на обёртку и не сработает)
 //    - Поиск по отделам/сотрудникам с автоскроллом и подсветкой узла
+//    - Мультикомпанийность: селектор в шапке фильтрует дерево/чипы/поиск
+//      по Department.company / Employee.company (предки всегда видны)
+//    - Deep links: выбор отдела/сотрудника пишется в URL-hash
+//      (#dept=... / #emp=...) — ссылками можно делиться, кнопка «Назад»
+//      браузера закрывает панель (hashchange)
+//    - Realtime: doc_events на сервере публикуют org_chart_mtp_refresh
+//      после коммита — открытые страницы мягко обновляют данные
+//      (debounce 1.5 с, зум/пан/сворачивание/выбор сохраняются)
+//    - «+ Добавить цель» в панели отдела и сотрудника: создаёт Goal
+//      из hrms; права — только HR или вышестоящий начальник (сервер
+//      проверяет строже, чем права doctype)
 //    - Экспорт всего оргчарта: PNG / JPG (масштаб, качество)
-//      и векторный PDF с выделяемым текстом (рендер на сервере)
-//      с откатом на растровый PDF, если сервер не может
+//      и векторный PDF с выделяемым текстом (рендер на сервере,
+//      с per-user rate-limit) с откатом на растровый PDF клиента
 //    - Плитка отдела: ЦКП (по умолчанию) или Функции — переключается
 //      в шапке и в Org Chart Settings; выбор запоминается
 //    - Боковая панель: Функции (по умолчанию) или ЦКП — переключается
@@ -32,11 +43,16 @@
 
 var APP_NAME = 'org_chart_mtp';
 var METHOD_PATH = 'org_chart_mtp.org_chart.page.org_chart_mtp.org_chart_mtp.get_org_data';
+var CREATE_GOAL_METHOD = 'org_chart_mtp.org_chart.page.org_chart_mtp.org_chart_mtp.create_goal';
 var NEUTRAL_COLOR = '#475569';
 var TILE_KEY = 'org_chart_mtp_tile_mode';
 var PANEL_KEY = 'org_chart_mtp_panel_mode';
+var COMPANY_KEY = 'org_chart_mtp_company';
+var REALTIME_EVENT = 'org_chart_mtp_refresh';
 var PAN_THRESHOLD = 5;    // px: превышение = pan, иначе — клик
 var PAN_CLICK_GUARD = 200; // мс: клики сразу после пана игнорируются
+var COMPANY_ALL = '__all__';
+var SOFT_REFRESH_DELAY = 1500; // мс: debounce realtime-обновления
 
 frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
     var page = frappe.ui.make_app_page({
@@ -68,6 +84,15 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
         searchTerm: '',
         hasCentered: false,
         exportSize: null,    // кэш размеров контейнера экспорта (для диалога)
+        // Мультикомпанийность: '__all__' | имя компании
+        companyFilter: COMPANY_ALL,
+        companies: [],
+        filtered: { departments: [], employees: [] }, // данные после фильтра компании
+        // Цели: отделы, куда пользователь может добавлять цели (HR — все)
+        goalEditableDepts: [],
+        goalStatusOptions: [],
+        softRefreshTimer: null,
+        refreshCount: 0,     // счётчик обновлений (data-refresh-count, удобно для E2E)
     };
 
     // === HTML-каркас + CSS ===
@@ -192,6 +217,12 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
             .org-export-controls button svg { width: 12px; height: 12px; }
             .org-export-controls button:hover { background: #f3f4f6; color: #111827; }
             .org-export-controls button:disabled { opacity: 0.5; cursor: wait; }
+            .org-company-select { border: 1px solid #e5e7eb; border-radius: 6px; background: white; padding: 6px 8px; font-size: 12px; color: #374151; outline: none; max-width: 190px; cursor: pointer; }
+            .org-company-select:focus { border-color: #60a5fa; box-shadow: 0 0 0 3px rgba(37,99,235,0.12); }
+            .org-goals-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 12px; }
+            .org-add-goal-btn { display: inline-flex; align-items: center; gap: 4px; padding: 5px 10px; border: 1px solid #2563eb; border-radius: 4px; background: #2563eb; color: white; font-size: 11px; font-weight: 600; cursor: pointer; white-space: nowrap; transition: background 0.15s; }
+            .org-add-goal-btn:hover { background: #1d4ed8; }
+            .org-add-goal-btn svg { width: 11px; height: 11px; }
             .org-node, .org-emp-chip, .org-collapse-btn { -webkit-tap-highlight-color: transparent; }
             @keyframes orgPulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(37,99,235,0); } 50% { box-shadow: 0 0 0 10px rgba(37,99,235,0.45); } }
             .org-node.org-highlight { animation: orgPulse 0.9s ease-in-out 2; border-color: #2563eb; z-index: 5; }
@@ -209,6 +240,7 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
                     <div class="org-search-dropdown" id="org-search-dropdown"></div>
                 </div>
                 <div class="org-header-controls">
+                    <select class="org-company-select" id="org-company-select" style="display:none;" title="${__('Фильтр по компании')}"></select>
                     <div class="org-switcher" title="${__('Что показывать на плитке отдела')}">
                         <span class="org-switcher-label">${__('Плитка')}:</span>
                         <button class="org-switch-btn" data-tile-mode="ЦКП">${__('ЦКП')}</button>
@@ -254,6 +286,7 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
         calendar: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>',
         chevronDown: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>',
         chevronRight: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>',
+        plus: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>',
         lock: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>',
     };
 
@@ -289,51 +322,208 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
     });
 
     // === Загрузка данных ===
-
-    frappe.call({
-        method: METHOD_PATH,
-        callback: function (r) {
-            if (r.message) {
-                state.data = r.message;
-                state.permissions = r.message.permissions || {};
-                state.settings = r.message.settings || state.settings;
-                buildDepthMap();
-                // Порядок приоритета: выбор пользователя (localStorage) → настройки → ЦКП/Функции
-                var savedTile = window.localStorage.getItem(TILE_KEY);
-                state.tileMode = savedTile || state.settings.card_default || 'ЦКП';
-                var savedPanel = window.localStorage.getItem(PANEL_KEY);
-                state.panelMode = savedPanel || state.settings.panel_default || 'Функции';
-                updateSwitcherUI();
-                $('#org-stats').text(
-                    state.data.departments.length + ' ' + __('узлов') + ' · ' +
-                    state.data.employees.length + ' ' + __('сотрудников')
-                );
-                renderTree();
-                centerContent();
-            } else {
+    // opts:
+    //   keepModes     — не перетирать режимы плитки/панели/фильтр компании
+    //                  (realtime-обновление и пересоздание цели)
+    //   keepSelection — переоткрыть текущую панель после обновления,
+    //                  если её узел ещё существует
+    //   center       — центрировать дерево (только первая загрузка)
+    //   after        — колбэк после успешного рендера
+    function loadData(opts) {
+        opts = opts || {};
+        frappe.call({
+            method: METHOD_PATH,
+            callback: function (r) {
+                if (r.message) {
+                    var prevSelection = state.selection;
+                    state.data = r.message;
+                    state.permissions = r.message.permissions || {};
+                    if (!opts.keepModes) {
+                        state.settings = r.message.settings || state.settings;
+                        // Приоритет: выбор пользователя (localStorage) → настройки → ЦКП/Функции
+                        var savedTile = window.localStorage.getItem(TILE_KEY);
+                        state.tileMode = savedTile || state.settings.card_default || 'ЦКП';
+                        var savedPanel = window.localStorage.getItem(PANEL_KEY);
+                        state.panelMode = savedPanel || state.settings.panel_default || 'Функции';
+                    }
+                    state.companies = r.message.companies || [];
+                    state.goalEditableDepts = r.message.goal_editable_depts || [];
+                    state.goalStatusOptions = r.message.goal_status_options || [];
+                    if (!opts.keepModes) restoreCompanyFilter();
+                    else validateCompanyFilter();
+                    applyCompanyFilter();
+                    buildDepthMap();
+                    updateSwitcherUI();
+                    updateCompanySelector();
+                    updateStats();
+                    renderTree();
+                    if (opts.center) centerContent();
+                    if (opts.keepSelection && prevSelection) reopenPanel(prevSelection);
+                    state.refreshCount++;
+                    var cv = document.getElementById('org-canvas');
+                    if (cv) cv.setAttribute('data-refresh-count', String(state.refreshCount));
+                    if (opts.after) opts.after();
+                } else {
+                    $('#org-canvas').html('<div style="text-align:center;padding:40px;color:#ef4444;">' +
+                        '<p>' + __('Ошибка: данные не получены от сервера.') + '</p>' +
+                        '<p style="font-size:11px;color:#9ca3af;">' + __('Проверьте, что метод') + ' <code>' + METHOD_PATH + '</code> ' + __('существует') + '</p>' +
+                        '</div>');
+                }
+            },
+            error: function (err) {
                 $('#org-canvas').html('<div style="text-align:center;padding:40px;color:#ef4444;">' +
-                    '<p>' + __('Ошибка: данные не получены от сервера.') + '</p>' +
-                    '<p style="font-size:11px;color:#9ca3af;">' + __('Проверьте, что метод') + ' <code>' + METHOD_PATH + '</code> ' + __('существует') + '</p>' +
+                    '<p>' + __('Ошибка загрузки данных') + ': ' + (err && err.message ? err.message : __('неизвестная')) + '</p>' +
+                    '<p style="font-size:11px;color:#9ca3af;">' + __('Приложение') + ': <code>' + APP_NAME + '</code>, ' + __('метод') + ': <code>' + METHOD_PATH + '</code></p>' +
                     '</div>');
+            },
+        });
+    }
+
+    // Первая загрузка: после рендера — deep link из URL-hash, если есть
+    loadData({
+        center: true,
+        after: function () {
+            var target = parseLocationHash();
+            if (target) {
+                // небольшой таймаут: канвас должен получить размеры после центрирования
+                setTimeout(function () { openFromHash(target); }, 200);
             }
-        },
-        error: function (err) {
-            $('#org-canvas').html('<div style="text-align:center;padding:40px;color:#ef4444;">' +
-                '<p>' + __('Ошибка загрузки данных') + ': ' + (err && err.message ? err.message : __('неизвестная')) + '</p>' +
-                '<p style="font-size:11px;color:#9ca3af;">' + __('Приложение') + ': <code>' + APP_NAME + '</code>, ' + __('метод') + ': <code>' + METHOD_PATH + '</code></p>' +
-                '</div>');
         },
     });
 
+    // === Мультикомпанийность ===
+    function restoreCompanyFilter() {
+        var saved = null;
+        try { saved = window.localStorage.getItem(COMPANY_KEY); } catch (e) { /* приватный режим */ }
+        if (saved && saved !== COMPANY_ALL && state.companies.indexOf(saved) < 0) {
+            saved = COMPANY_ALL; // компания исчезла с сайта
+        }
+        state.companyFilter = saved || COMPANY_ALL;
+    }
+
+    function validateCompanyFilter() {
+        if (state.companyFilter !== COMPANY_ALL
+                && state.companies.indexOf(state.companyFilter) < 0) {
+            state.companyFilter = COMPANY_ALL;
+        }
+    }
+
+    // Пересчёт state.filtered: отделы выбранной компании + их предки
+    // (связность дерева), сотрудники по Employee.company (или отделу,
+    // который остался видим — совместимость со старыми записями без компании)
+    function applyCompanyFilter() {
+        var d = (state.data && state.data.departments) || [];
+        var e = (state.data && state.data.employees) || [];
+        if (state.companyFilter === COMPANY_ALL || !state.companies.length) {
+            state.filtered = { departments: d, employees: e };
+            return;
+        }
+        var company = state.companyFilter;
+        var keep = {};
+        d.forEach(function (dept) { if (dept.company === company) keep[dept.name] = true; });
+        var byName = {};
+        d.forEach(function (dept) { byName[dept.name] = dept; });
+        Object.keys(keep).forEach(function (name) {
+            var cur = byName[name];
+            var guard = 0;
+            while (cur && cur.parent_department && guard++ < 50) {
+                keep[cur.parent_department] = true;
+                cur = byName[cur.parent_department];
+            }
+        });
+        state.filtered = {
+            departments: d.filter(function (dept) { return keep[dept.name]; }),
+            employees: e.filter(function (emp) {
+                return emp.company === company || keep[emp.department];
+            }),
+        };
+    }
+
+    function updateCompanySelector() {
+        var sel = document.getElementById('org-company-select');
+        if (!sel) return;
+        if ((state.companies || []).length < 2) {
+            // одна компания — фильтр не нужен
+            sel.style.display = 'none';
+            return;
+        }
+        sel.style.display = '';
+        var html = '<option value="' + COMPANY_ALL + '">' + __('Все компании') + '</option>';
+        state.companies.forEach(function (c) {
+            html += '<option value="' + escapeHtml(c) + '"' + (c === state.companyFilter ? ' selected' : '') + '>'
+                + escapeHtml(c) + '</option>';
+        });
+        sel.innerHTML = html;
+    }
+
+    function updateStats() {
+        $('#org-stats').text(
+            state.filtered.departments.length + ' ' + __('узлов') + ' · ' +
+            state.filtered.employees.length + ' ' + __('сотрудников')
+        );
+    }
+
+    $('#org-company-select').on('change', function () {
+        setCompanyFilter($(this).val() || COMPANY_ALL);
+    });
+
+    function setCompanyFilter(company) {
+        state.companyFilter = company;
+        try { window.localStorage.setItem(COMPANY_KEY, company); } catch (e) { /* приватный режим */ }
+        applyCompanyFilter();
+        renderTree();
+        updateStats();
+        centerContent();
+        // Открытая панель могла остаться на узле другой компании
+        if (state.selection) {
+            var sel = state.selection;
+            var stillVisible = sel.kind === 'node'
+                ? state.filtered.departments.some(function (x) { return x.name === sel.id; })
+                : state.filtered.employees.some(function (x) { return x.name === sel.id; });
+            if (!stillVisible) closePanel();
+        }
+    }
+
+    // Узел из другой компании (deep link/поиск) — переключаем фильтр на «все»
+    function ensureDeptVisible(deptName) {
+        if (state.filtered.departments.some(function (x) { return x.name === deptName; })) return true;
+        if (state.data.departments.some(function (x) { return x.name === deptName; })) {
+            setCompanyFilter(COMPANY_ALL);
+            $('#org-company-select').val(COMPANY_ALL);
+            return true;
+        }
+        return false;
+    }
+
+    function ensureEmployeeVisible(empName) {
+        if (state.filtered.employees.some(function (x) { return x.name === empName; })) return true;
+        if (state.data.employees.some(function (x) { return x.name === empName; })) {
+            setCompanyFilter(COMPANY_ALL);
+            $('#org-company-select').val(COMPANY_ALL);
+            return true;
+        }
+        return false;
+    }
+
     // === Утилиты для работы с данными ===
+    // Дерево всегда работает с state.filtered — данными ПОСЛЕ фильтра
+    // компании (при «Все компании» — полный набор без копирования)
+    function findInAllDepartments(name) {
+        return (state.data && state.data.departments || []).find(function (d) { return d.name === name; }) || null;
+    }
+
+    function findInAllEmployees(name) {
+        return (state.data && state.data.employees || []).find(function (e) { return e.name === name; }) || null;
+    }
+
     function getChildren(parentId) {
-        return state.data.departments.filter(function (d) {
+        return state.filtered.departments.filter(function (d) {
             return d.parent_department === parentId;
         });
     }
 
     function getEmployees(deptName) {
-        return state.data.employees.filter(function (e) {
+        return state.filtered.employees.filter(function (e) {
             return e.department === deptName && e.status === 'Active';
         });
     }
@@ -495,11 +685,11 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
 
     function renderTree() {
         state.exportSize = null; // дерево изменилось — сброс кэша размеров экспорта
-        if (!state.data || state.data.departments.length === 0) {
+        if (!state.data || state.filtered.departments.length === 0) {
             $('#org-canvas').html('<div style="text-align:center;padding:40px;color:#9ca3af;">' + __('Нет данных. Создайте Department в ERPNext.') + '</div>');
             return;
         }
-        var roots = state.data.departments.filter(function (d) {
+        var roots = state.filtered.departments.filter(function (d) {
             return !d.parent_department;
         });
         var html = '';
@@ -522,14 +712,14 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
             e.stopPropagation();
             if (isPanClick()) return;
             var nodeId = $(this).data('node-id');
-            var node = state.data.departments.find(function (d) { return d.name === nodeId; });
+            var node = state.filtered.departments.find(function (d) { return d.name === nodeId; });
             if (node) openNodePanel(node);
         });
         $('[data-emp-id]').off('click').on('click', function (e) {
             e.stopPropagation();
             if (isPanClick()) return;
             var empId = $(this).data('emp-id');
-            var emp = state.data.employees.find(function (em) { return em.name === empId; });
+            var emp = state.filtered.employees.find(function (em) { return em.name === empId; });
             if (emp) openEmployeePanel(emp);
         });
         $('[data-collapse-id]').off('click').on('click', function (e) {
@@ -543,11 +733,18 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
     }
 
     // === Панель отдела ===
+    function closePanel() {
+        $('#org-side-panel').hide();
+        state.selection = null;
+        clearHash();
+    }
+
     function openNodePanel(node) {
         state.selection = { kind: 'node', id: node.name };
         state.activeTab = 'folder';
         renderNodePanel(node);
         $('#org-side-panel').show();
+        updateHash('node', node.name);
     }
 
     function renderNodePanel(node) {
@@ -619,17 +816,16 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
 
         $('#org-side-panel').html(html);
 
-        $('#panel-close').off('click').on('click', function () {
-            $('#org-side-panel').hide(); state.selection = null;
-        });
+        $('#panel-close').off('click').on('click', closePanel);
         $('.org-tab').off('click').on('click', function () {
             state.activeTab = $(this).data('tab');
             renderNodePanel(node);
         });
+        bindAddGoalButtons();
         $('[data-emp-id]').off('click').on('click', function (e) {
             e.stopPropagation();
             var empId = $(this).data('emp-id');
-            var emp = state.data.employees.find(function (em) { return em.name === empId; });
+            var emp = state.filtered.employees.find(function (em) { return em.name === empId; }) || findInAllEmployees(empId);
             if (emp) openEmployeePanel(emp);
         });
     }
@@ -721,6 +917,109 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
             ICONS.link + '</div></a>';
     }
 
+    // === Права на создание целей ===
+    // Отдел: HR или руководитель ветки, которой принадлежит отдел
+    function canAddDeptGoal(deptName) {
+        if (!state.permissions) return false;
+        if (state.permissions.is_hr) return true;
+        return (state.goalEditableDepts || []).indexOf(deptName) >= 0;
+    }
+
+    // Сотрудник: HR или вышестоящий начальник (не сам себе)
+    function canAddEmployeeGoal(empName) {
+        if (!state.permissions) return false;
+        if (state.permissions.is_hr) return true;
+        var visible = state.permissions.visible_employee_ids || [];
+        return visible.indexOf(empName) >= 0 && empName !== state.permissions.current_employee;
+    }
+
+    // Кнопки «+ Добавить цель» в панелях (навешиваются после рендера панели)
+    function bindAddGoalButtons() {
+        $('[data-add-goal-dept]').off('click').on('click', function (e) {
+            e.stopPropagation();
+            openGoalDialog({ department: $(this).data('add-goal-dept') });
+        });
+        $('[data-add-goal-emp]').off('click').on('click', function (e) {
+            e.stopPropagation();
+            openGoalDialog({ employee: $(this).data('add-goal-emp') });
+        });
+    }
+
+    // === Диалог создания цели (Goal из hrms) ===
+    // Права проверяет сервер (create_goal): только HR или вышестоящий
+    // начальник — клиент лишь прячет кнопку у тех, кому точно нельзя.
+    function openGoalDialog(opts) {
+        opts = opts || {};
+        var isDept = !!opts.department;
+        var statusOptions = (state.goalStatusOptions && state.goalStatusOptions.length)
+            ? state.goalStatusOptions
+            : ['Pending', 'In Progress', 'Completed', 'Archived', 'Closed'];
+        var empObj = opts.employee ? findInAllEmployees(opts.employee) : null;
+        var defaultDept = opts.department || (empObj && empObj.department) || '';
+
+        var d = new frappe.ui.Dialog({
+            title: isDept ? __('Новая цель отдела') : __('Новая цель сотрудника'),
+            fields: [
+                {
+                    fieldname: 'goal_name', label: __('Название цели'), fieldtype: 'Data', reqd: 1,
+                    placeholder: isDept ? __('Например: Выручка направления 500 млн') : __('Например: 10 продлений контрактов'),
+                },
+                {
+                    fieldname: 'status', label: __('Статус'), fieldtype: 'Select',
+                    options: statusOptions, default: 'Pending',
+                },
+                {
+                    fieldname: 'employee', label: __('Владелец (сотрудник)'), fieldtype: 'Link',
+                    options: 'Employee', reqd: 1, default: opts.employee || '',
+                    read_only: opts.employee ? 1 : 0,
+                    description: isDept ? __('Ответственный за цель отдела') : __('Кому назначается цель'),
+                },
+                {
+                    fieldname: 'custom_department', label: __('Отдел'), fieldtype: 'Link',
+                    options: 'Department', default: defaultDept,
+                    read_only: isDept ? 1 : 0,
+                    description: isDept
+                        ? __('Цель будет закреплена за этим отделом')
+                        : __('Заполните, чтобы сделать цель целью отдела'),
+                },
+                {
+                    fieldname: 'start_date', label: __('Начало'), fieldtype: 'Date',
+                    default: frappe.datetime.get_today(),
+                },
+                { fieldname: 'end_date', label: __('Срок'), fieldtype: 'Date' },
+                { fieldname: 'progress', label: __('Прогресс, %'), fieldtype: 'Int', default: 0 },
+            ],
+            primary_action_label: __('Создать'),
+            primary_action: function () {
+                var values = d.get_values();
+                if (!values) return;
+                frappe.call({
+                    method: CREATE_GOAL_METHOD,
+                    args: {
+                        goal_name: values.goal_name,
+                        employee: values.employee,
+                        custom_department: values.custom_department || '',
+                        status: values.status,
+                        start_date: values.start_date,
+                        end_date: values.end_date,
+                        progress: values.progress,
+                    },
+                    callback: function () {
+                        d.hide();
+                        frappe.show_alert({
+                            message: __('Цель создана'),
+                            indicator: 'green',
+                        });
+                        // Мягкое обновление: данные + открытая панель
+                        // (остальным клиентам придёт realtime-событие)
+                        loadData({ keepModes: true, keepSelection: true });
+                    },
+                });
+            },
+        });
+        d.show();
+    }
+
     function renderGoalsTab(node) {
         var canViewGoals = (state.permissions && state.permissions.is_hr) || (state.permissions && state.permissions.is_manager);
         if (!canViewGoals) {
@@ -732,10 +1031,15 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
         var deptGoals = (state.data.dept_goals && state.data.dept_goals[node.name]) || [];
         var html = '';
 
-        html += '<div class="org-section-title">' + ICONS.target + '<span>' + __('Цели отдела') + ' (' + deptGoals.length + ')</span></div>';
+        html += '<div class="org-goals-head">';
+        html += '<div class="org-section-title" style="margin-bottom:0;">' + ICONS.target + '<span>' + __('Цели отдела') + ' (' + deptGoals.length + ')</span></div>';
+        if (canAddDeptGoal(node.name)) {
+            html += '<button class="org-add-goal-btn" data-add-goal-dept="' + escapeHtml(node.name) + '">' + ICONS.plus + __('Добавить цель') + '</button>';
+        }
+        html += '</div>';
         if (deptGoals.length === 0) {
             html += '<p style="font-size:11px;color:#9ca3af;font-style:italic;margin-bottom:16px;">' +
-                __('Целей нет. Создайте Goal в HRMS и закрепите её за отделом полем «Отдел»') + '</p>';
+                __('Целей нет. Добавьте кнопкой «Добавить цель» или создайте Goal в HRMS и закрепите её за отделом полем «Отдел»') + '</p>';
         } else {
             html += renderGoalItems(deptGoals, true);
         }
@@ -748,6 +1052,7 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
         state.activeTab = 'folder';
         renderEmployeePanel(emp);
         $('#org-side-panel').show();
+        updateHash('employee', emp.name);
     }
 
     function renderEmployeePanel(emp) {
@@ -795,10 +1100,20 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
         } else if (state.activeTab === 'wiki') {
             html += renderWikiTab('/app/Employee/' + encodeURIComponent(emp.name));
         } else if (state.activeTab === 'goals') {
+            var canAdd = canAddEmployeeGoal(emp.name);
+            if (canAdd) {
+                html += '<div class="org-goals-head">';
+                html += '<div class="org-section-title" style="margin-bottom:0;">' + ICONS.target + '<span>' + __('Цели') + ' (' + goals.length + ')</span></div>';
+                html += '<button class="org-add-goal-btn" data-add-goal-emp="' + escapeHtml(emp.name) + '">' + ICONS.plus + __('Добавить цель') + '</button>';
+                html += '</div>';
+            }
             if (goals.length === 0) {
-                html += '<div class="org-restricted"><p>' + __('Целей нет') + '</p></div>';
+                html += '<div class="org-restricted"><p>' +
+                    (canAdd ? __('Целей нет — добавьте первую кнопкой выше') : __('Целей нет')) + '</p></div>';
             } else {
-                html += '<div class="org-section-title">' + ICONS.target + '<span>' + __('Цели') + ' (' + goals.length + ')</span></div>';
+                if (!canAdd) {
+                    html += '<div class="org-section-title">' + ICONS.target + '<span>' + __('Цели') + ' (' + goals.length + ')</span></div>';
+                }
                 html += renderGoalItems(goals, false);
             }
         }
@@ -806,13 +1121,12 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
 
         $('#org-side-panel').html(html);
 
-        $('#panel-close').off('click').on('click', function () {
-            $('#org-side-panel').hide(); state.selection = null;
-        });
+        $('#panel-close').off('click').on('click', closePanel);
         $('.org-tab').off('click').on('click', function () {
             state.activeTab = $(this).data('tab');
             renderEmployeePanel(emp);
         });
+        bindAddGoalButtons();
     }
 
     // === Зум к курсору и панорамирование ===
@@ -945,11 +1259,11 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
         var term = (state.searchTerm || '').trim().toLowerCase();
         if (!term || !state.data) { closeSearchDropdown(); return; }
 
-        var depts = state.data.departments.filter(function (d) {
+        var depts = state.filtered.departments.filter(function (d) {
             return (d.department_name || '').toLowerCase().indexOf(term) >= 0
                 || (d.name || '').toLowerCase().indexOf(term) >= 0;
         }).slice(0, 7);
-        var emps = state.data.employees.filter(function (emp) {
+        var emps = state.filtered.employees.filter(function (emp) {
             return (emp.employee_name || '').toLowerCase().indexOf(term) >= 0;
         }).slice(0, 7);
 
@@ -997,8 +1311,9 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
 
     function expandAncestors(deptName) {
         // развернуть всех предков, чтобы узел стал виден в DOM
+        // (поиск в отфильтрованном наборе — предки выбранной компании всегда в нём)
         var byName = {};
-        state.data.departments.forEach(function (d) { byName[d.name] = d; });
+        state.filtered.departments.forEach(function (d) { byName[d.name] = d; });
         var cur = byName[deptName];
         var guard = 0;
         while (cur && cur.parent_department && guard++ < 50) {
@@ -1042,8 +1357,7 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
     }
 
     function scrollToDepartment(deptName) {
-        var dept = state.data.departments.find(function (d) { return d.name === deptName; });
-        if (!dept) return;
+        if (!ensureDeptVisible(deptName)) return;
         expandAncestors(deptName);
         renderTree();
         requestAnimationFrame(function () {
@@ -1053,7 +1367,8 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
     }
 
     function scrollToEmployee(empId) {
-        var emp = state.data.employees.find(function (em) { return em.name === empId; });
+        if (!ensureEmployeeVisible(empId)) return;
+        var emp = findInAllEmployees(empId);
         if (!emp) return;
         var deptName = emp.department;
         if (deptName) {
@@ -1070,6 +1385,112 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
                 }
             });
         }
+    }
+
+    // === Deep links: выбор отдела/сотрудника в URL-hash ===
+    // #dept=<имя отдела> / #emp=<сотрудник>. Запись в hash создаёт запись
+    // истории — кнопка «Назад» браузера закрывает панель. Роутер frappe
+    // v16 работает на pushState-путях и сохраняет hash страницы,
+    // hashchange он не слушает — конфликтов нет.
+    function parseLocationHash() {
+        var h = (window.location.hash || '').replace(/^#/, '');
+        if (!h) return null;
+        var m = h.match(/^(dept|emp)=(.+)$/);
+        if (!m) return null;
+        var id;
+        try { id = decodeURIComponent(m[2]); } catch (e) { id = m[2]; }
+        return { kind: m[1] === 'dept' ? 'node' : 'employee', id: id };
+    }
+
+    function updateHash(kind, id) {
+        var prefix = kind === 'node' ? 'dept' : 'emp';
+        var newHash = '#' + prefix + '=' + encodeURIComponent(id);
+        if (window.location.hash === newHash) return;
+        window.location.hash = newHash;
+    }
+
+    function clearHash() {
+        if (!window.location.hash) return;
+        // replaceState (без записи в историю): закрытие панели само по себе
+        // не должно плодить записи «назад»
+        history.replaceState(null, '', window.location.pathname + window.location.search);
+    }
+
+    window.addEventListener('hashchange', function () {
+        if (!state.data) return;
+        var target = parseLocationHash();
+        if (!target) {
+            // hash убрали (кнопка «Назад») — закрываем панель
+            if (state.selection) {
+                $('#org-side-panel').hide();
+                state.selection = null;
+            }
+            return;
+        }
+        // уже открыто — не трогаем (наш собственный updateHash)
+        if (state.selection && state.selection.kind === target.kind && state.selection.id === target.id) return;
+        openFromHash(target);
+    });
+
+    function openFromHash(target) {
+        if (!state.data) return;
+        if (target.kind === 'node') {
+            var node = findInAllDepartments(target.id);
+            if (!node || !ensureDeptVisible(target.id)) return;
+            expandAncestors(target.id);
+            renderTree();
+            openNodePanel(node);
+            requestAnimationFrame(function () {
+                var el = canvasWrapper.querySelector('[data-node-id="' + cssEscape(target.id) + '"]');
+                centerOnElement(el, 'org-highlight');
+            });
+        } else {
+            var emp = findInAllEmployees(target.id);
+            if (!emp || !ensureEmployeeVisible(target.id)) return;
+            if (emp.department) {
+                expandAncestors(emp.department);
+                renderTree();
+            }
+            openEmployeePanel(emp);
+            requestAnimationFrame(function () {
+                var chip = canvasWrapper.querySelector('[data-emp-id="' + cssEscape(target.id) + '"]');
+                if (chip) centerOnElement(chip, 'org-highlight');
+            });
+        }
+    }
+
+    // === Realtime: мягкое обновление при изменениях данных ===
+    // Сервер (doc_events) публикует org_chart_mtp_refresh после коммита;
+    // страница перезагружает данные с debounce, сохраняя зум/пан/
+    // свёрнутость/режимы/открытую панель.
+    if (window.frappe && frappe.realtime && typeof frappe.realtime.on === 'function') {
+        frappe.realtime.on(REALTIME_EVENT, function () {
+            clearTimeout(state.softRefreshTimer);
+            state.softRefreshTimer = setTimeout(function () {
+                loadData({ keepModes: true, keepSelection: true });
+            }, SOFT_REFRESH_DELAY);
+        });
+    }
+
+    // Переоткрыть панель после мягкого обновления (если узел ещё существует
+    // и остался в текущем фильтре компании)
+    function reopenPanel(sel) {
+        if (sel.kind === 'node') {
+            var node = findInAllDepartments(sel.id);
+            if (node && state.filtered.departments.some(function (d) { return d.name === sel.id; })) {
+                renderNodePanel(node);
+                $('#org-side-panel').show();
+                return;
+            }
+        } else {
+            var emp = findInAllEmployees(sel.id);
+            if (emp && state.filtered.employees.some(function (e) { return e.name === sel.id; })) {
+                renderEmployeePanel(emp);
+                $('#org-side-panel').show();
+                return;
+            }
+        }
+        closePanel();
     }
 
     // === Экспорт: PNG / JPG / векторный PDF ===

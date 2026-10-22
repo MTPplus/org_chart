@@ -46,11 +46,20 @@ class TestOrgChartScopes(FrappeTestCase):
                 for doctype, filters in [
                         ("Goal", {"employee": ["like", "OCMTP-%"]}),
                         ("Employee", {"name": ["like", "OCMTP-%"]}),
-                        ("Department", {"name": ["like", "OCMTP%"]}),
-                        ("KRA", {"name": ["like", "OCMTP%"]}),
                 ]:
                         for name in frappe.get_all(doctype, filters=filters, pluck="name"):
                                 frappe.delete_doc(doctype, name, force=True, ignore_permissions=True)
+                # Department — дерево: удалять снизу вверх (lft DESC), иначе
+                # NestedSetChildExistsError на родителе с живыми детьми
+                for name in frappe.get_all(
+                        "Department",
+                        filters={"name": ["like", "OCMTP%"]},
+                        pluck="name",
+                        order_by="lft desc",
+                ):
+                        frappe.delete_doc("Department", name, force=True, ignore_permissions=True)
+                for name in frappe.get_all("KRA", filters={"name": ["like", "OCMTP%"]}, pluck="name"):
+                        frappe.delete_doc("KRA", name, force=True, ignore_permissions=True)
                 for user in (HR_USER, DIR_USER, KAM_USER, EMP_USER):
                         if frappe.db.exists("User", user):
                                 frappe.delete_doc("User", user, force=True, ignore_permissions=True)
@@ -68,8 +77,12 @@ class TestOrgChartScopes(FrappeTestCase):
                 perms = data["permissions"]
                 self.assertTrue(perms["is_hr"], "HR-должность должна давать полный доступ")
                 self.assertEqual(perms["current_designation"], "HR Manager")
-                # Все 5 личных целей
-                self.assertEqual(len(data["goals"]), 5)
+                # Все 5 личных целей фикстуры (демо-цели сайта не считаем —
+                # тест должен проходить и на заполненном сайте)
+                ocmtp_emps = {self.hr_emp, self.dir_emp, self.kam_emp, self.emp_emp}
+                self.assertEqual(
+                        len([g for g in data["goals"] if g["employee"] in ocmtp_emps]), 5
+                )
                 # Цели обоих отделов
                 self.assertEqual(len(data["dept_goals"].get(self.sales, [])), 1)
                 self.assertEqual(len(data["dept_goals"].get(self.support, [])), 1)
@@ -82,7 +95,10 @@ class TestOrgChartScopes(FrappeTestCase):
                 frappe.set_user(EMP_USER)
                 data = get_org_data()
                 self.assertTrue(data["permissions"]["is_hr"])
-                self.assertEqual(len(data["goals"]), 5)
+                ocmtp_emps = {self.hr_emp, self.dir_emp, self.kam_emp, self.emp_emp}
+                self.assertEqual(
+                        len([g for g in data["goals"] if g["employee"] in ocmtp_emps]), 5
+                )
 
         # --- Руководитель: своя ветка по reports_to ----------------------------
 
@@ -117,12 +133,19 @@ class TestOrgChartScopes(FrappeTestCase):
                 self.assertEqual(data["dept_goals"], {}, "Цели отделов рядовому скрыты")
 
         def test_structure_is_public_for_everyone(self):
-                """Структура, ЦКП и сотрудники видны всем скоупам."""
+                """Структура, ЦКП и сотрудники видны всем скоупам.
+
+                Считаем только фикстурные узлы (префикс имени) — на сайте
+                могут быть демо-отделы и сотрудники, тест не должен
+                зависеть от наполнения сайта.
+                """
                 for user in (HR_USER, DIR_USER, KAM_USER, EMP_USER):
                         frappe.set_user(user)
                         data = get_org_data()
-                        self.assertEqual(len(data["departments"]), 4, f"департаменты для {user}")
-                        self.assertEqual(len(data["employees"]), 4, f"сотрудники для {user}")
+                        depts = [d for d in data["departments"] if d["name"].startswith("OCMTP ")]
+                        emps = [e for e in data["employees"] if (e["name"] or "").startswith("OCMTP-")]
+                        self.assertEqual(len(depts), 4, f"департаменты для {user}")
+                        self.assertEqual(len(emps), 4, f"сотрудники для {user}")
 
         # --- Данные отделов: цвет, ЦКП, метрики -------------------------------
 
@@ -138,7 +161,7 @@ class TestOrgChartScopes(FrappeTestCase):
                 frappe.set_user(EMP_USER)
                 data = get_org_data()
                 by_name = {d["name"]: d for d in data["departments"]}
-                self.assertEqual(by_name[self.sales]["kra_title"], "Рост выручки продаж")
+                self.assertEqual(by_name[self.sales]["kra_title"], "OCMTP KRA Выручка")
                 self.assertEqual(by_name[self.support]["kra_title"], None)
 
         # --- Панель сотрудника: ограничения ------------------------------------
