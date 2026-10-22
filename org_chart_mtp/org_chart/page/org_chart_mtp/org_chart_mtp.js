@@ -12,6 +12,11 @@
 //      зажатие ЛКМ на плитке = пан, короткий клик = открыть плитку
 //      (захват указателя — только после порога движения, иначе click
 //      по плитке ретаргетится на обёртку и не сработает)
+//    - Мобильная версия (<=768px): шапка в два ряда, зум — плавающими
+//      кнопками, панель — нижняя шторка (затемнение, свайп вниз —
+//      закрыть); pinch-zoom двумя пальцами и двойной тап по фону;
+//      все мобильные CSS-правила скоуплены .org-root (не попадают
+//      в клон экспорта)
 //    - Поиск по отделам/сотрудникам с автоскроллом и подсветкой узла
 //    - Мультикомпанийность: селектор в шапке фильтрует дерево/чипы/поиск
 //      по Department.company / Employee.company (предки всегда видны)
@@ -50,7 +55,15 @@ var PANEL_KEY = 'org_chart_mtp_panel_mode';
 var COMPANY_KEY = 'org_chart_mtp_company';
 var REALTIME_EVENT = 'org_chart_mtp_refresh';
 var PAN_THRESHOLD = 5;    // px: превышение = pan, иначе — клик
+var PAN_THRESHOLD_TOUCH = 10; // px: у пальца дрожание выше, чем у мыши
 var PAN_CLICK_GUARD = 200; // мс: клики сразу после пана игнорируются
+var MOBILE_QUERY = '(max-width: 768px)'; // тот же брейкпоинт, что в CSS страницы
+var DOUBLE_TAP_MS = 300;   // мс: окно двойного тапа (зум на телефоне)
+var DOUBLE_TAP_DIST = 35;  // px: допустимый разброс пальца между тапами
+
+function isMobileScreen() {
+    return window.matchMedia && window.matchMedia(MOBILE_QUERY).matches;
+}
 var COMPANY_ALL = '__all__';
 var SOFT_REFRESH_DELAY = 1500; // мс: debounce realtime-обновления
 
@@ -227,6 +240,57 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
             @keyframes orgPulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(37,99,235,0); } 50% { box-shadow: 0 0 0 10px rgba(37,99,235,0.45); } }
             .org-node.org-highlight { animation: orgPulse 0.9s ease-in-out 2; border-color: #2563eb; z-index: 5; }
             .org-emp-chip.org-highlight { animation: orgPulse 0.9s ease-in-out 2; border-color: #2563eb; background: #eff6ff; color: #1d4ed8; }
+            .org-hint { cursor: pointer; transition: opacity 0.4s; }
+            /* ===== Мобильная версия (<=768px): два ряда шапки, плавающий зум,
+               панель — нижняя шторка. ВСЕ селекторы через .org-root: экспорт
+               клонирует <style> внутрь контейнера без .org-root-обёртки —
+               мобильные правила не должны попадать в картинки/PDF ===== */
+            .org-panel-backdrop { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(17,24,39,0.4); z-index: 1044; }
+            @keyframes orgSheetUp { from { transform: translateY(100%); } to { transform: translateY(0); } }
+            @media (max-width: 768px) {
+                .org-root { height: calc(100vh - 96px); height: calc(100dvh - 96px); }
+                .org-root .org-header { padding: 8px 12px; gap: 6px 10px; }
+                .org-root .org-header h1 { font-size: 13px; white-space: nowrap; }
+                .org-root .org-header .stats { margin-left: 6px; font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+                .org-root .org-header > div:first-child { order: 1; flex: 0 1 auto; min-width: 0; overflow: hidden; }
+                .org-root .org-header-controls { display: contents; }
+                .org-root .org-export-controls { order: 4; flex-shrink: 0; }
+                .org-root .org-export-controls button { padding: 8px 12px; }
+                .org-root .org-export-controls .org-btn-label { display: none; }
+                .org-root .org-search { order: 3; flex: 1 1 100%; min-width: 0; }
+                .org-root .org-search-input { width: 100%; padding: 9px 10px 9px 30px; font-size: 16px; } /* 16px: iOS не зумит страницу при фокусе */
+                .org-root .org-search-dropdown { width: 100%; max-height: 45vh; }
+                .org-root .org-search-item { padding: 11px 12px; }
+                .org-root .org-company-select { order: 2; max-width: 108px; font-size: 12px; padding: 6px 4px; flex-shrink: 1; margin-left: auto; }
+                .org-root .org-switcher { order: 5; flex-shrink: 0; }
+                .org-root .org-switcher-label { display: none; }
+                .org-root .org-switch-btn { padding: 6px 10px; font-size: 12px; }
+                .org-root .org-header button, .org-root .org-header select { touch-action: manipulation; } /* без 300мс-задержки и двойного-тап зума */
+                .org-root .org-zoom-controls { position: fixed; right: 12px; bottom: calc(14px + env(safe-area-inset-bottom, 0px)); flex-direction: column; border-radius: 12px; box-shadow: 0 4px 18px rgba(0,0,0,0.18); z-index: 1040; overflow: hidden; }
+                .org-root .org-zoom-controls button { min-width: 44px; min-height: 42px; padding: 0 10px; font-size: 18px; }
+                .org-root .org-zoom-controls #zoom-reset { border-left: none; border-top: 1px solid #e5e7eb; font-size: 15px; }
+                .org-root .org-zoom-controls .zoom-value { min-width: 44px; font-size: 11px; padding: 2px 6px; }
+                .org-root .org-hint { top: 10px; left: 10px; max-width: calc(100vw - 24px); font-size: 11px; padding: 7px 10px; }
+                .org-root .org-panel-backdrop.open { display: block; }
+                .org-root .org-side-panel { position: absolute; left: 0; right: 0; bottom: 0; top: auto; width: 100%; max-height: 78vh; max-height: 78dvh; border-left: none; border-top: 1px solid #e5e7eb; border-radius: 14px 14px 0 0; box-shadow: 0 -10px 40px rgba(0,0,0,0.25); z-index: 1045; animation: orgSheetUp 0.28s cubic-bezier(0.32, 0.72, 0, 1); padding-bottom: env(safe-area-inset-bottom, 0px); }
+                .org-root .org-side-panel::before { content: ''; position: absolute; top: 7px; left: 50%; transform: translateX(-50%); width: 38px; height: 4px; border-radius: 2px; background: #d1d5db; z-index: 2; }
+                .org-root .org-panel-header { padding: 16px 12px 10px; touch-action: none; } /* зона свайпа вниз */
+                .org-root .org-panel-header .icon { width: 36px; height: 36px; }
+                .org-root .org-panel-close { min-width: 38px; min-height: 38px; margin: -4px -6px 0 0; }
+                .org-root .org-panel-close svg { width: 18px; height: 18px; }
+                .org-root .org-panel-content { -webkit-overflow-scrolling: touch; padding: 12px; }
+                .org-root .org-tab { padding: 11px 4px; font-size: 12px; }
+                .org-root .org-emp-chip { padding: 4px 8px; font-size: 11px; }
+                .org-root .org-collapse-btn { width: 28px; height: 28px; }
+                .org-root .org-collapse-btn svg { width: 14px; height: 14px; }
+            }
+            /* Диалоги приложения (экспорт / новая цель) вписываем в экран телефона.
+               Селекторы НЕ через .org-root: фраппе вешает модалки на body. */
+            @media (max-width: 768px) {
+                .org-chart-dialog .modal-dialog { margin: 10px; width: calc(100vw - 20px); max-width: 460px; }
+                .org-chart-dialog .modal-content { max-height: calc(100vh - 40px); max-height: calc(100dvh - 40px); display: flex; flex-direction: column; }
+                .org-chart-dialog .modal-body { overflow-y: auto; -webkit-overflow-scrolling: touch; }
+            }
         </style>
         <div class="org-root">
             <div class="org-header">
@@ -254,7 +318,7 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
                     <div class="org-export-controls">
                         <button id="export-btn" title="${__('Экспорт оргчарта: PNG / JPG (с выбором разрешения) или векторный PDF (текст выделяется)')}">
                             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-                            ${__('Экспорт')}
+                            <span class="org-btn-label">${__('Экспорт')}</span>
                         </button>
                     </div>
                     <div class="org-zoom-controls">
@@ -268,10 +332,55 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
             <div class="org-canvas-wrapper" id="org-canvas-wrapper">
                 <div class="org-canvas" id="org-canvas"></div>
                 <div class="org-hint" id="org-hint">${__('Колесо мыши — зум к курсору · перетаскивание — пан · клик по карточке — детали')}</div>
+                <div class="org-panel-backdrop" id="org-panel-backdrop"></div>
                 <div class="org-side-panel" id="org-side-panel" style="display:none;"></div>
             </div>
         </div>
     `);
+
+    // === Мобильная адаптация: подсказка под тач + скрытие по тапу ===
+    var mql = window.matchMedia ? window.matchMedia(MOBILE_QUERY) : null;
+    function syncHintText() {
+        var hint = document.getElementById('org-hint');
+        if (!hint) return;
+        hint.textContent = (mql && mql.matches)
+            ? __('Щипок — зум · перетаскивание — пан · тап по карточке — детали')
+            : __('Колесо мыши — зум к курсору · перетаскивание — пан · клик по карточке — детали');
+    }
+    syncHintText();
+    if (mql && mql.addEventListener) mql.addEventListener('change', syncHintText);
+
+    // Высота страницы = остаток экрана ниже хрома Frappe. На мобиле
+    // navbar/page-head ниже, чем на десктопе, и разница зависит от
+    // устройства — замеряем, а не угадываем в CSS (десктоп не трогаем).
+    function fitRootHeight() {
+        var el = document.querySelector('.org-root');
+        if (!el) return;
+        if (mql && mql.matches) {
+            var top = el.getBoundingClientRect().top;
+            el.style.height = Math.max(320, window.innerHeight - top) + 'px';
+        } else {
+            el.style.height = '';
+        }
+    }
+    // Первый замер — только после укладки DOM: сразу после вставки
+    // getBoundingClientRect().top ещё 0 (хром Frappe не отрисован),
+    // и высота завышается на высоту навбара
+    requestAnimationFrame(function () { requestAnimationFrame(fitRootHeight); });
+    setTimeout(fitRootHeight, 350); // страховка после полной отрисовки
+    window.addEventListener('resize', fitRootHeight);
+    if (mql && mql.addEventListener) mql.addEventListener('change', fitRootHeight);
+    var orgHintEl = document.getElementById('org-hint');
+    if (orgHintEl) {
+        orgHintEl.addEventListener('click', function () { orgHintEl.style.display = 'none'; });
+        // подсказка сама уходит через 9 секунд, чтобы не занимать экран
+        setTimeout(function () {
+            if (orgHintEl.style.display !== 'none') {
+                orgHintEl.style.opacity = '0';
+                setTimeout(function () { orgHintEl.style.display = 'none'; }, 450);
+            }
+        }, 9000);
+    }
 
     // === SVG иконки ===
     var ICONS = {
@@ -735,15 +844,25 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
     // === Панель отдела ===
     function closePanel() {
         $('#org-side-panel').hide();
+        $('#org-panel-backdrop').removeClass('open');
         state.selection = null;
         clearHash();
     }
+
+    // Панель и мобильное затемнение появляются/уходят вместе
+    // (на десктопе шторка-затемнение скрыта CSS — класс безвреден)
+    function showPanelChrome() {
+        $('#org-side-panel').show();
+        $('#org-panel-backdrop').addClass('open');
+    }
+    var orgBackdropEl = document.getElementById('org-panel-backdrop');
+    if (orgBackdropEl) orgBackdropEl.addEventListener('click', closePanel);
 
     function openNodePanel(node) {
         state.selection = { kind: 'node', id: node.name };
         state.activeTab = 'folder';
         renderNodePanel(node);
-        $('#org-side-panel').show();
+        showPanelChrome();
         updateHash('node', node.name);
     }
 
@@ -1017,6 +1136,7 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
                 });
             },
         });
+        if (d.$wrapper) d.$wrapper.addClass('org-chart-dialog'); // мобильная ширина диалога
         d.show();
     }
 
@@ -1051,7 +1171,7 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
         state.selection = { kind: 'employee', id: emp.name };
         state.activeTab = 'folder';
         renderEmployeePanel(emp);
-        $('#org-side-panel').show();
+        showPanelChrome();
         updateHash('employee', emp.name);
     }
 
@@ -1149,8 +1269,15 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
     }
 
     function centerContent() {
-        state.tx = 40;
-        state.ty = 40;
+        // На телефоне центрируем корневую плитку (360px) в видимой ширине
+        if (isMobileScreen()) {
+            var rect = document.getElementById('org-canvas-wrapper').getBoundingClientRect();
+            state.tx = Math.max(8, (rect.width - 360) / 2);
+            state.ty = 24;
+        } else {
+            state.tx = 40;
+            state.ty = 40;
+        }
         state.hasCentered = true;
         applyTransform();
     }
@@ -1179,7 +1306,7 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
         zoomAtPoint(mx, my, delta);
     }, { passive: false });
 
-    // === Панорамирование: pointer events (мышь + тач/планшет единообразно) ===
+    // === Панорамирование + pinch-zoom: pointer events (мышь + тач) ===
     // Зажатие в ЛЮБОМ месте канваса (включая плитку) = пан;
     // короткий клик без движения = действие (открыть плитку/чип/кнопку).
     // Боковая панель не участвует в пане.
@@ -1191,9 +1318,54 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
     // (баг из issue-отчёта юзера: «клик по пластинке перестал работать»).
     // При захвате с началом пана чистый клик идёт нативно на плитку,
     // а click сразу после пана всё равно гасится порогом + гардом lastPanEnd.
+    //
+    // Мобильные жесты (два указателя): pinch-zoom вокруг середины щипка
+    // (+ пан, если середина сместилась); после щипка оставшийся палец
+    // продолжает пан. Двойной тап по фону — зум к точке.
+    var pointers = new Map();  // pointerId → {x, y} — активные указатели на канвасе
+    var pinch = null;          // {dist, cx, cy, scale, tx, ty} — база щипка
+
+    function pinchStart() {
+        var pts = Array.from(pointers.values()).slice(0, 2);
+        var dx = pts[0].x - pts[1].x, dy = pts[0].y - pts[1].y;
+        var rect = canvasWrapper.getBoundingClientRect();
+        pinch = {
+            dist: Math.max(1, Math.sqrt(dx * dx + dy * dy)),
+            cx: (pts[0].x + pts[1].x) / 2 - rect.left,
+            cy: (pts[0].y + pts[1].y) / 2 - rect.top,
+            scale: state.scale, tx: state.tx, ty: state.ty,
+        };
+        // щипок отменяет одиночный пан и гасит возможный клик
+        state.isPointerDown = false;
+        state.isPanning = false;
+        state.panMoved = true;
+        canvasWrapper.classList.remove('panning');
+    }
+
+    function pinchApply() {
+        if (!pinch || pointers.size < 2) return;
+        var pts = Array.from(pointers.values()).slice(0, 2);
+        var dx = pts[0].x - pts[1].x, dy = pts[0].y - pts[1].y;
+        var dist = Math.max(1, Math.sqrt(dx * dx + dy * dy));
+        var rect = canvasWrapper.getBoundingClientRect();
+        var cx = (pts[0].x + pts[1].x) / 2 - rect.left;
+        var cy = (pts[0].y + pts[1].y) / 2 - rect.top;
+        var newScale = Math.min(2.5, Math.max(0.3, pinch.scale * dist / pinch.dist));
+        // мировая точка, что была под стартовым центром щипка, остаётся под центром сейчас
+        var wx = (pinch.cx - pinch.tx) / pinch.scale;
+        var wy = (pinch.cy - pinch.ty) / pinch.scale;
+        state.scale = newScale;
+        state.tx = cx - wx * newScale;
+        state.ty = cy - wy * newScale;
+        applyTransform();
+    }
+
     canvasWrapper.addEventListener('pointerdown', function (e) {
         if (e.target.closest('#org-side-panel')) return;
         if (e.pointerType === 'mouse' && e.button !== 0) return;
+        pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+        if (pointers.size === 2) { pinchStart(); return; }
+        if (pointers.size > 2) return; // третий палец не меняет жест
         state.isPointerDown = true;
         state.panMoved = false;
         state.activePointerId = e.pointerId;
@@ -1201,10 +1373,14 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
         // ВАЖНО: здесь НЕ вызываем setPointerCapture (см. комментарий выше)
     });
     canvasWrapper.addEventListener('pointermove', function (e) {
+        if (pointers.has(e.pointerId)) pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+        if (pinch && pointers.size >= 2) { pinchApply(); return; }
         if (!state.isPointerDown || e.pointerId !== state.activePointerId) return;
         var dx = e.clientX - state.panStart.x;
         var dy = e.clientY - state.panStart.y;
-        if (!state.panMoved && Math.sqrt(dx * dx + dy * dy) < PAN_THRESHOLD) return;
+        // у пальца дрожание выше — порог больше, чтобы тап не превращался в пан
+        var threshold = e.pointerType === 'touch' ? PAN_THRESHOLD_TOUCH : PAN_THRESHOLD;
+        if (!state.panMoved && Math.sqrt(dx * dx + dy * dy) < threshold) return;
         if (!state.panMoved) {
             // Жест стал паном — теперь захватываем указатель, чтобы
             // события продолжали приходить даже за пределами обёртки.
@@ -1219,8 +1395,52 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
         state.ty = state.panStart.ty + dy;
         applyTransform();
     });
+
+    // Двойной тап по фону — зум к точке (только тач; слушатель стоит
+    // до endPan, чтобы видеть state.panMoved до его сброса)
+    var lastTap = { t: 0, x: 0, y: 0 };
+    canvasWrapper.addEventListener('pointerup', function (e) {
+        if (e.pointerType === 'mouse' || pinch || state.panMoved) return;
+        if (e.target.closest('.org-node') || e.target.closest('.org-emp-chip') ||
+            e.target.closest('.org-collapse-btn') || e.target.closest('#org-side-panel') ||
+            e.target.closest('.org-hint')) return;
+        var now = Date.now();
+        var dx = e.clientX - lastTap.x, dy = e.clientY - lastTap.y;
+        if (now - lastTap.t < DOUBLE_TAP_MS && dx * dx + dy * dy < DOUBLE_TAP_DIST * DOUBLE_TAP_DIST) {
+            var rect = canvasWrapper.getBoundingClientRect();
+            zoomAtPoint(e.clientX - rect.left, e.clientY - rect.top, 0.25);
+            lastTap.t = 0; // третий тап подряд не должен зумить ещё раз
+        } else {
+            lastTap.t = now;
+        }
+        lastTap.x = e.clientX;
+        lastTap.y = e.clientY;
+    });
+
     function endPan(e) {
-        if (!state.isPointerDown) return;
+        pointers.delete(e.pointerId);
+        if (pinch) {
+            if (pointers.size < 2) {
+                // щипок закончился: гасим клики; если остался один палец —
+                // продолжаем им пан с новой базой
+                pinch = null;
+                state.lastPanEnd = Date.now();
+                if (pointers.size === 1) {
+                    var pid = null, p = null;
+                    pointers.forEach(function (v, k) { pid = k; p = v; });
+                    state.isPointerDown = true;
+                    state.activePointerId = pid;
+                    state.panMoved = true; // продолжение жеста, не клик
+                    state.panStart = { x: p.x, y: p.y, tx: state.tx, ty: state.ty };
+                } else {
+                    state.panMoved = false;
+                }
+            }
+            return;
+        }
+        // pointerup и последующий lostpointercapture приходят парой —
+        // обрабатываем только событие активного указателя
+        if (!state.isPointerDown || e.pointerId !== state.activePointerId) return;
         state.isPointerDown = false;
         state.activePointerId = null;
         if (state.panMoved) state.lastPanEnd = Date.now();
@@ -1231,6 +1451,38 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
     canvasWrapper.addEventListener('pointerup', endPan);
     canvasWrapper.addEventListener('pointercancel', endPan);
     canvasWrapper.addEventListener('lostpointercapture', endPan);
+
+    // === Мобильная шторка: свайп вниз за шапку закрывает панель ===
+    var sheetDrag = null;
+    var orgPanelEl = document.getElementById('org-side-panel');
+    orgPanelEl.addEventListener('pointerdown', function (e) {
+        if (!isMobileScreen() || e.pointerType === 'mouse') return;
+        if (!e.target.closest('.org-panel-header')) return;
+        sheetDrag = { id: e.pointerId, startY: e.clientY, dy: 0, moved: false };
+    });
+    orgPanelEl.addEventListener('pointermove', function (e) {
+        if (!sheetDrag || e.pointerId !== sheetDrag.id) return;
+        sheetDrag.dy = e.clientY - sheetDrag.startY;
+        if (sheetDrag.dy > 10) {
+            sheetDrag.moved = true;
+            orgPanelEl.style.transform = 'translateY(' + Math.min(sheetDrag.dy, 240) + 'px)';
+        }
+    });
+    function sheetDragEnd(e) {
+        if (!sheetDrag || e.pointerId !== sheetDrag.id) return;
+        var moved = sheetDrag.moved, dy = sheetDrag.dy;
+        sheetDrag = null;
+        orgPanelEl.style.transform = '';
+        if (moved) {
+            if (dy > 90) closePanel();
+            // не даём клику после драга открыть ссылку/кнопку в шапке панели
+            var kill = function (ev) { ev.stopPropagation(); ev.preventDefault(); };
+            orgPanelEl.addEventListener('click', kill, true);
+            setTimeout(function () { orgPanelEl.removeEventListener('click', kill, true); }, 250);
+        }
+    }
+    orgPanelEl.addEventListener('pointerup', sheetDragEnd);
+    orgPanelEl.addEventListener('pointercancel', sheetDragEnd);
 
     // === Поиск по отделам и сотрудникам ===
     var searchInput = document.getElementById('org-search-input');
@@ -1479,14 +1731,14 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
             var node = findInAllDepartments(sel.id);
             if (node && state.filtered.departments.some(function (d) { return d.name === sel.id; })) {
                 renderNodePanel(node);
-                $('#org-side-panel').show();
+                showPanelChrome();
                 return;
             }
         } else {
             var emp = findInAllEmployees(sel.id);
             if (emp && state.filtered.employees.some(function (e) { return e.name === sel.id; })) {
                 renderEmployeePanel(emp);
-                $('#org-side-panel').show();
+                showPanelChrome();
                 return;
             }
         }
@@ -1890,6 +2142,7 @@ frappe.pages['org_chart_mtp'].on_page_load = function (wrapper) {
             }
         });
         d.fields_dict.format.df.onchange = syncExportFields;
+        if (d.$wrapper) d.$wrapper.addClass('org-chart-dialog'); // мобильная ширина диалога
         return d;
     }
 
